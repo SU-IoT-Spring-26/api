@@ -105,6 +105,19 @@ if SAVE_DATA:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _parse_temperature(value: Any) -> float:
+    """Convert a temperature value to float. Accepts numbers or strings like '21.3' or '21.3°C'."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    # Strip trailing °C, °F, or other non-numeric suffix
+    for suffix in ("°C", "°F", "C", "F", "°"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+            break
+    return float(s)
+
+
 def temperature_to_color(temp: float, min_temp: float, max_temp: float) -> Tuple[int, int, int]:
     temp = max(min_temp, min(max_temp, temp))
     if max_temp == min_temp:
@@ -124,15 +137,16 @@ def temperature_to_color(temp: float, min_temp: float, max_temp: float) -> Tuple
 def expand_thermal_data(compact_data: dict) -> dict:
     width = compact_data["w"]
     height = compact_data["h"]
-    min_temp = compact_data["min"]
-    max_temp = compact_data["max"]
+    min_temp = _parse_temperature(compact_data["min"])
+    max_temp = _parse_temperature(compact_data["max"])
     temps = compact_data["t"]
     pixels = []
     for i, temp in enumerate(temps):
+        t_float = _parse_temperature(temp)
         row = i // width
         col = i % width
-        r, g, b = temperature_to_color(temp, min_temp, max_temp)
-        pixels.append({"row": row, "col": col, "temp": temp, "r": r, "g": g, "b": b})
+        r, g, b = temperature_to_color(t_float, min_temp, max_temp)
+        pixels.append({"row": row, "col": col, "temp": t_float, "r": r, "g": g, "b": b})
     return {
         "width": width,
         "height": height,
@@ -145,13 +159,13 @@ def expand_thermal_data(compact_data: dict) -> dict:
 def thermal_data_to_array(data: dict) -> np.ndarray:
     if "t" in data:
         width, height = data["w"], data["h"]
-        temps = data["t"]
+        temps = [_parse_temperature(t) for t in data["t"]]
     elif "pixels" in data:
         width, height = data["width"], data["height"]
-        temps = [p["temp"] for p in data["pixels"]]
+        temps = [_parse_temperature(p["temp"]) for p in data["pixels"]]
     else:
         raise ValueError("Unknown thermal data format")
-    return np.array(temps).reshape((height, width))
+    return np.array(temps, dtype=float).reshape((height, width))
 
 
 def estimate_room_temperature(temp_array: np.ndarray) -> float:
