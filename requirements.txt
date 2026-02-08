@@ -1,0 +1,6 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+numpy>=1.20.0
+scipy>=1.7.0
+azure-storage-blob>=12.19.0
+requests>=2.25.0
