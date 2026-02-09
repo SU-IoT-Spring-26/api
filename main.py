@@ -338,7 +338,7 @@ def list_sensors() -> dict:
 def get_thermal_history(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
     date: Optional[str] = Query(default=None, description="YYYYMMDD (optional)"),
-    limit: int = Query(default=100, description="Max frames to return (1..500)"),
+    limit: int = Query(default=1000, description="Max frames to return (1..1000)"),
     offset: int = Query(default=0, description="Number of matching frames to skip"),
     include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
 ) -> dict:
@@ -346,7 +346,7 @@ def get_thermal_history(
     Return locally stored thermal frames (all sensors by default).
     Uses the saved JSON files under THERMAL_DATA_DIR.
     """
-    limit_i = _safe_int(limit, 100, 1, 500)
+    limit_i = _safe_int(limit, 100, 1, 1000)
     offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
 
     matches: List[dict] = []
