@@ -99,6 +99,9 @@ ROOM_TEMP_THRESHOLD = 0.5
 latest_thermal_data: Optional[dict] = None
 last_update_time: Optional[str] = None
 latest_occupancy: Optional[dict] = None
+latest_thermal_by_sensor: Dict[str, dict] = {}
+last_update_time_by_sensor: Dict[str, str] = {}
+latest_occupancy_by_sensor: Dict[str, dict] = {}
 _data_counter = 0
 
 if SAVE_DATA:
@@ -294,6 +297,107 @@ def save_occupancy_data(occupancy_result: dict) -> None:
         print(f"Error saving occupancy data: {e}")
 
 
+def _iter_thermal_files() -> List[Path]:
+    """Return all locally stored thermal frame files (compact + expanded)."""
+    if not DATA_DIR.exists():
+        return []
+    files = [p for p in DATA_DIR.glob("thermal_*.json") if p.is_file()]
+    # Newest first (filenames include timestamp)
+    files.sort(key=lambda p: p.name, reverse=True)
+    return files
+
+
+def _safe_int(value: Optional[int], default: int, min_value: int, max_value: int) -> int:
+    try:
+        v = int(value) if value is not None else int(default)
+    except Exception:
+        v = int(default)
+    return max(min_value, min(max_value, v))
+
+
+@app.get("/api/sensors")
+def list_sensors() -> dict:
+    """List known sensor IDs (from memory + stored files)."""
+    sensors = set(latest_thermal_by_sensor.keys()) | set(latest_occupancy_by_sensor.keys())
+    # Add sensors found on disk
+    for p in _iter_thermal_files():
+        # Filename: thermal_<safe_id>_<ts>_<suffix>.json ; safe_id may differ from original.
+        # Prefer payload sensor_id for correctness.
+        try:
+            payload = json.loads(p.read_text())
+            sid = payload.get("sensor_id")
+            if sid:
+                sensors.add(str(sid))
+        except Exception:
+            continue
+    out = sorted(sensors)
+    return {"count": len(out), "sensors": out}
+
+
+@app.get("/api/thermal/history")
+def get_thermal_history(
+    sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
+    date: Optional[str] = Query(default=None, description="YYYYMMDD (optional)"),
+    limit: int = Query(default=100, description="Max frames to return (1..500)"),
+    offset: int = Query(default=0, description="Number of matching frames to skip"),
+    include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
+) -> dict:
+    """
+    Return locally stored thermal frames (all sensors by default).
+    Uses the saved JSON files under THERMAL_DATA_DIR.
+    """
+    limit_i = _safe_int(limit, 100, 1, 500)
+    offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
+
+    matches: List[dict] = []
+    seen = 0
+    for p in _iter_thermal_files():
+        try:
+            payload = json.loads(p.read_text())
+        except Exception:
+            continue
+
+        sid = payload.get("sensor_id")
+        ts = payload.get("timestamp")
+        fmt = payload.get("format")
+
+        if sensor_id is not None and str(sid) != str(sensor_id):
+            continue
+        if date:
+            # timestamp is ISO; YYYY-MM-DD... compare by prefix after stripping dashes
+            try:
+                ymd = str(ts)[:10].replace("-", "")
+            except Exception:
+                ymd = ""
+            if ymd != date:
+                continue
+
+        if seen < offset_i:
+            seen += 1
+            continue
+
+        entry: dict = {
+            "file": p.name,
+            "timestamp": ts,
+            "sensor_id": sid,
+            "format": fmt,
+        }
+        if include_data:
+            entry["data"] = payload.get("data")
+        matches.append(entry)
+        if len(matches) >= limit_i:
+            break
+
+    return {
+        "sensor_id": sensor_id,
+        "date": date,
+        "limit": limit_i,
+        "offset": offset_i,
+        "count": len(matches),
+        "data": matches,
+    }
+
+
 @app.get("/api/test")
 def test() -> dict:
     """Health check for Azure and clients."""
@@ -320,7 +424,12 @@ def receive_thermal_data(data: dict) -> dict:
     occupancy_result = estimate_occupancy(data)
     occupancy_result["sensor_id"] = sensor_id
     latest_occupancy = occupancy_result
-    last_update_time = datetime.now().isoformat()
+    now_iso = datetime.now().isoformat()
+    last_update_time = now_iso
+    # Per-sensor latest state
+    latest_thermal_by_sensor[sensor_id] = dict(latest_thermal_data) if latest_thermal_data else {}
+    latest_occupancy_by_sensor[sensor_id] = dict(occupancy_result)
+    last_update_time_by_sensor[sensor_id] = now_iso
     save_thermal_data(compact_data, latest_thermal_data, sensor_id)
     save_occupancy_data(occupancy_result)
     pixel_count = len(latest_thermal_data.get("pixels", []))
@@ -332,8 +441,22 @@ def receive_thermal_data(data: dict) -> dict:
 
 
 @app.get("/api/thermal")
-def get_thermal_data() -> dict:
+def get_thermal_data(
+    sensor_id: Optional[str] = Query(default=None, description="If set, return latest for this sensor_id"),
+) -> dict:
     """Return latest thermal data (expanded format with occupancy)."""
+    if sensor_id:
+        data = latest_thermal_by_sensor.get(sensor_id)
+        if not data:
+            raise HTTPException(status_code=404, detail=f"No data available for sensor_id={sensor_id}")
+        out = dict(data)
+        out["last_update"] = last_update_time_by_sensor.get(sensor_id)
+        occ = latest_occupancy_by_sensor.get(sensor_id)
+        if occ:
+            out["occupancy"] = occ.get("occupancy")
+            out["room_temperature"] = occ.get("room_temperature")
+        return out
+
     if latest_thermal_data is None:
         raise HTTPException(status_code=404, detail="No data available")
     out = dict(latest_thermal_data)
