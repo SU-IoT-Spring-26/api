@@ -12,7 +12,9 @@ FastAPI service for receiving and storing thermal camera data from ESP32 devices
 |--------|------|-------------|
 | GET | `/api/test` | Health check |
 | POST | `/api/thermal` | Submit thermal data (compact or expanded JSON) |
-| GET | `/api/thermal` | Latest thermal data + occupancy |
+| GET | `/api/thermal` | Latest thermal data + occupancy (optionally `?sensor_id=...` for specific sensor) |
+| GET | `/api/sensors` | List all known sensor IDs |
+| GET | `/api/thermal/history` | Browse stored thermal frames (`?sensor_id=...`, `?date=YYYYMMDD`, `?limit=...`, `?offset=...`, `?include_data=true`) |
 | GET | `/api/occupancy/history` | Occupancy log for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
 | GET | `/api/occupancy/stats` | Occupancy stats for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
 
@@ -91,3 +93,35 @@ Compact format from ESP32:
 **Local storage:** thermal frames under `THERMAL_DATA_DIR` as `thermal_<sensor_id>_<timestamp>_compact.json` and `_expanded.json`; occupancy as `occupancy_YYYYMMDD.jsonl` with one JSON object per line.
 
 **Azure Blob Storage** (when `AZURE_STORAGE_CONNECTION_STRING` is set): same data is also written to the configured container. Thermal files go under the `thermal/` prefix (e.g. `thermal/thermal_sensor1_20250107_120000_compact.json`). Occupancy is appended to `occupancy/occupancy_YYYYMMDD.jsonl` (append blobs). Local storage is always used when `SAVE_THERMAL_DATA` is true; Blob is an additional copy.
+
+## Multi-sensor support
+
+The API tracks data from **all sensors** and makes it available via the endpoints:
+
+### Latest data per sensor
+
+- **`GET /api/thermal?sensor_id=<id>`** – Returns the latest thermal frame **for that specific sensor** (with occupancy).
+- **`GET /api/thermal`** (no `sensor_id`) – Returns the latest frame from whichever sensor posted most recently (backwards compatible).
+
+### List sensors
+
+- **`GET /api/sensors`** – Returns a list of all known sensor IDs (from in-memory state and stored files).
+
+### Browse stored thermal history
+
+- **`GET /api/thermal/history`** – Returns stored thermal frames from disk (all sensors by default).
+
+**Query parameters:**
+- `sensor_id` (optional) – Filter to frames from a specific sensor
+- `date=YYYYMMDD` (optional) – Filter to frames from a specific date
+- `limit` (default: 100, max: 500) – Maximum number of frames to return
+- `offset` (default: 0) – Number of matching frames to skip (for paging)
+- `include_data` (default: false) – If `true`, include full frame payload; if `false`, return metadata only (timestamp, sensor_id, format, filename)
+
+**Examples:**
+- All sensors, newest 100 (metadata only): `GET /api/thermal/history`
+- One sensor with full frames: `GET /api/thermal/history?sensor_id=living-room&include_data=true`
+- All sensors for a specific day: `GET /api/thermal/history?date=20260207&limit=500`
+- Page through results: `GET /api/thermal/history?limit=50&offset=0`, then `?limit=50&offset=50`, etc.
+
+**Note:** The history endpoint reads from locally stored files under `THERMAL_DATA_DIR`. Each frame includes `timestamp` (server receive time) and `sensor_id` alongside the thermal data.
