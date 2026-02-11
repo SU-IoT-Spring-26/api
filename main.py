@@ -440,7 +440,7 @@ def receive_thermal_data(data: dict) -> dict:
     }
 
 
-@app.get("/api/thermal")
+@app.get("/api/thermal/current/poll")
 def get_thermal_data(
     sensor_id: Optional[str] = Query(default=None, description="If set, return latest for this sensor_id"),
 ) -> dict:
@@ -465,6 +465,37 @@ def get_thermal_data(
         out["occupancy"] = latest_occupancy["occupancy"]
         out["room_temperature"] = latest_occupancy.get("room_temperature")
     return out
+
+
+@app.get("/api/thermal/current/all")
+def get_all_thermal_data() -> dict:
+    """Return latest thermal data for all sensors."""
+    result = {}
+    for sensor_id, data in latest_thermal_by_sensor.items():
+        out = dict()
+        out["building"] = data.get("building", "Other")
+        out["last_update"] = last_update_time_by_sensor.get(sensor_id)
+        occ = latest_occupancy_by_sensor.get(sensor_id)
+        if occ:
+            out["occupancy"] = occ.get("occupancy")
+            out["room_temperature"] = occ.get("room_temperature")
+        result[sensor_id] = out
+    return result
+
+
+# TODO: build actual prediction model
+@app.get("/api/thermal/predicted/poll")
+def get_predicted_thermal_data_poll(
+    sensor_id: Optional[str] = Query(default=None, description="If set, return latest for this sensor_id"),
+) -> dict:
+    """Return latest thermal data (expanded format with occupancy)."""
+    return get_thermal_data(sensor_id)
+
+
+@app.get("/api/thermal/predicted/all")
+def get_predicted_thermal_data() -> dict:
+    """Return latest thermal data for all sensors."""
+    return get_all_thermal_data()
 
 
 @app.get("/api/occupancy/history")
