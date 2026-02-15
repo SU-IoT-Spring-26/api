@@ -79,10 +79,12 @@ def main() -> None:
     print(f"   OK: sensor_id={body.get('sensor_id')}, pixels={len(pixels)}, occupancy={body.get('occupancy')}, last_update={body.get('last_update', '')[:19]}")
     assert body.get("sensor_id") == "test-script", body.get("sensor_id")
     assert len(pixels) == FRAME_SIZE, len(pixels)
+    # Use server's date (from last_update) for occupancy calls so timezone mismatch doesn't 404
+    last_update = body.get("last_update") or ""
+    date_str = last_update[:10].replace("-", "") if len(last_update) >= 10 else datetime.now().strftime("%Y%m%d")
     print()
 
-    # 4. Occupancy history (today)
-    date_str = datetime.now().strftime("%Y%m%d")
+    # 4. Occupancy history (server date)
     print(f"4. GET /api/occupancy/history?date={date_str}")
     r = get(f"/api/occupancy/history?date={date_str}")
     r.raise_for_status()

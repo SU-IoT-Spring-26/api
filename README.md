@@ -17,6 +17,8 @@ FastAPI service for receiving and storing thermal camera data from ESP32 devices
 | GET | `/api/thermal/history` | Browse stored thermal frames (`?sensor_id=...`, `?date=YYYYMMDD`, `?limit=...`, `?offset=...`, `?include_data=true`) |
 | GET | `/api/occupancy/history` | Occupancy log for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
 | GET | `/api/occupancy/stats` | Occupancy stats for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
+| GET | `/api/occupancy/trends` | Occupancy and room temp by time bucket (`?date=...`, `?sensor_id=...`, `?bucket=hour\|day`) |
+| GET | `/api/occupancy/predict` | Predicted occupancy next 24–48h (`?sensor_id=...`, `?horizon_hours=24`) |
 
 ## Local run
 
@@ -59,6 +61,9 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - `PORT` – port to bind (Azure sets this automatically)
 - `AZURE_STORAGE_CONNECTION_STRING` – if set, thermal and occupancy data are also written to Azure Blob Storage (in addition to local disk)
 - `AZURE_STORAGE_CONTAINER_NAME` – blob container name (default: `iotoccupancydata`)
+- `BACKGROUND_ALPHA` – EMA weight for thermal background (default: `0.95`)
+- `BACKGROUND_MIN_FRAMES_EMPTY` – consecutive empty frames before updating background (default: `3`)
+- `FEVER_THRESHOLD_C` – temperature (°C) above which a cluster is flagged as fever (default: `37.5`)
 
 ## Test
 
@@ -125,3 +130,22 @@ The API tracks data from **all sensors** and makes it available via the endpoint
 - Page through results: `GET /api/thermal/history?limit=50&offset=0`, then `?limit=50&offset=50`, etc.
 
 **Note:** The history endpoint reads from locally stored files under `THERMAL_DATA_DIR`. Each frame includes `timestamp` (server receive time) and `sensor_id` alongside the thermal data.
+
+## Server-side features
+
+### Background subtraction
+
+When the room is empty for several consecutive frames, the server updates a per-sensor thermal background (EMA). Occupancy detection then uses temperature *above* background to reduce false positives from equipment/HVAC. Backgrounds are persisted under `THERMAL_DATA_DIR` as `background_<sensor_id>.npy`.
+
+### Fever detection
+
+Each detected person cluster gets a representative temperature (90th percentile of pixels in the cluster). Clusters above `FEVER_THRESHOLD_C` are flagged; responses include `fever_count`, `any_fever`, and per-cluster `representative_temp_c` / `fever_detected`. Stored in occupancy JSONL.
+
+### Trends and prediction
+
+- **`GET /api/occupancy/trends`** – Aggregates occupancy and room temperature by hour or day for a given date.
+- **`GET /api/occupancy/predict`** – Heuristic prediction for the next 1–48 hours using same hour-of-day average over the last 7 days.
+
+### Accuracy comparison
+
+See [scripts/README.md](scripts/README.md). Run `scripts/compare_occupancy_accuracy.py` with a ground-truth CSV to compute MAE and accuracy within 1 against local occupancy JSONL.

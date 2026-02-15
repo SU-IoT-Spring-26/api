@@ -8,7 +8,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 import json
 import os
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -94,6 +94,13 @@ MAX_HUMAN_TEMP = 45.0
 MIN_CLUSTER_SIZE = 3
 MAX_CLUSTER_SIZE = 200
 ROOM_TEMP_THRESHOLD = 0.5
+FEVER_THRESHOLD_C = float(os.environ.get("FEVER_THRESHOLD_C", "37.5"))
+
+# Background subtraction (thermal): per-sensor background, updated when room empty
+BACKGROUND_ALPHA = float(os.environ.get("BACKGROUND_ALPHA", "0.95"))  # EMA weight for existing background
+BACKGROUND_MIN_FRAMES_EMPTY = int(os.environ.get("BACKGROUND_MIN_FRAMES_EMPTY", "3"))  # Consecutive empty frames to update
+thermal_background_by_sensor: Dict[str, np.ndarray] = {}
+empty_frame_count_by_sensor: Dict[str, int] = {}
 
 # In-memory latest state
 latest_thermal_data: Optional[dict] = None
@@ -106,6 +113,30 @@ _data_counter = 0
 
 if SAVE_DATA:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_thermal_background(sensor_id: str) -> None:
+    """Load persisted thermal background for a sensor from disk if present."""
+    safe_id = _sanitize_sensor_id_for_filename(sensor_id)
+    path = DATA_DIR / f"background_{safe_id}.npy"
+    if path.exists():
+        try:
+            thermal_background_by_sensor[sensor_id] = np.load(path)
+        except Exception:
+            pass
+
+
+def _save_thermal_background(sensor_id: str) -> None:
+    """Persist thermal background for a sensor to disk."""
+    arr = thermal_background_by_sensor.get(sensor_id)
+    if arr is None:
+        return
+    safe_id = _sanitize_sensor_id_for_filename(sensor_id)
+    path = DATA_DIR / f"background_{safe_id}.npy"
+    try:
+        np.save(path, arr)
+    except Exception as e:
+        print(f"Error saving thermal background ({sensor_id}): {e}")
 
 
 def _parse_temperature(value: Any) -> float:
@@ -159,6 +190,26 @@ def expand_thermal_data(compact_data: dict) -> dict:
     }
 
 
+def collapse_to_compact(expanded_data: dict) -> dict:
+    """Convert expanded thermal data (pixels) to compact format (w, h, min, max, t)."""
+    width = expanded_data["width"]
+    height = expanded_data["height"]
+    pixels = expanded_data["pixels"]
+    # Row-major order (same as expand_thermal_data: index = row * width + col)
+    sorted_pixels = sorted(pixels, key=lambda p: (p["row"], p["col"]))
+    t = [_parse_temperature(p["temp"]) for p in sorted_pixels]
+    out = {
+        "w": width,
+        "h": height,
+        "min": round(min(t), 1),
+        "max": round(max(t), 1),
+        "t": [round(x, 1) for x in t],
+    }
+    if expanded_data.get("sensor_id") is not None:
+        out["sensor_id"] = expanded_data["sensor_id"]
+    return out
+
+
 def thermal_data_to_array(data: dict) -> np.ndarray:
     if "t" in data:
         width, height = data["w"], data["h"]
@@ -175,13 +226,20 @@ def estimate_room_temperature(temp_array: np.ndarray) -> float:
     return float(np.median(temp_array))
 
 
-def detect_human_heat(temp_array: np.ndarray, room_temp: float) -> np.ndarray:
-    human_mask = (temp_array >= MIN_HUMAN_TEMP) & (temp_array <= MAX_HUMAN_TEMP)
-    relative_mask = (temp_array - room_temp) >= ROOM_TEMP_THRESHOLD
-    return (human_mask & relative_mask).astype(int)
+def detect_human_heat(
+    temp_array: np.ndarray, room_temp: float, use_delta: bool = False
+) -> np.ndarray:
+    """Human heat mask. If use_delta True, temp_array is delta above background (same-threshold interpretation)."""
+    if use_delta:
+        human_mask = (temp_array >= ROOM_TEMP_THRESHOLD) & (temp_array <= MAX_HUMAN_TEMP)
+    else:
+        human_mask = (temp_array >= MIN_HUMAN_TEMP) & (temp_array <= MAX_HUMAN_TEMP)
+        relative_mask = (temp_array - room_temp) >= ROOM_TEMP_THRESHOLD
+        human_mask = human_mask & relative_mask
+    return human_mask.astype(int)
 
 
-def find_people_clusters(human_mask: np.ndarray) -> List[Dict]:
+def find_people_clusters(human_mask: np.ndarray, temp_array: np.ndarray) -> List[Dict]:
     structure = np.ones((3, 3), dtype=int)
     labeled_array, num_features = label(human_mask, structure=structure)
     people_clusters = []
@@ -191,26 +249,48 @@ def find_people_clusters(human_mask: np.ndarray) -> List[Dict]:
             cluster_pixels = np.where(labeled_array == i)
             center_row = int(np.mean(cluster_pixels[0]))
             center_col = int(np.mean(cluster_pixels[1]))
-            people_clusters.append({"id": i, "size": cluster_size, "center": (center_row, center_col)})
+            cluster_temps = temp_array[cluster_pixels[0], cluster_pixels[1]]
+            representative_temp_c = float(np.percentile(cluster_temps, 90)) if cluster_temps.size else 0.0
+            fever_detected = representative_temp_c >= FEVER_THRESHOLD_C
+            people_clusters.append({
+                "id": i,
+                "size": cluster_size,
+                "center": (center_row, center_col),
+                "representative_temp_c": round(representative_temp_c, 2),
+                "fever_detected": fever_detected,
+            })
     return people_clusters
 
 
-def estimate_occupancy(thermal_data: dict) -> dict:
+def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> dict:
     try:
         temp_array_2d = thermal_data_to_array(thermal_data)
         room_temp = estimate_room_temperature(temp_array_2d)
-        human_mask = detect_human_heat(temp_array_2d, room_temp)
-        people_clusters = find_people_clusters(human_mask)
+        array_for_detection = temp_array_2d
+        use_delta = False
+        if sensor_id and sensor_id in thermal_background_by_sensor:
+            background = thermal_background_by_sensor[sensor_id]
+            if background.shape == temp_array_2d.shape:
+                delta = np.maximum(0.0, temp_array_2d - background)
+                array_for_detection = delta
+                use_delta = True
+        human_mask = detect_human_heat(array_for_detection, room_temp, use_delta=use_delta)
+        people_clusters = find_people_clusters(human_mask, temp_array_2d)
+        fever_count = sum(1 for c in people_clusters if c.get("fever_detected"))
         return {
             "occupancy": len(people_clusters),
             "room_temperature": room_temp,
             "people_clusters": people_clusters,
+            "fever_count": fever_count,
+            "any_fever": fever_count > 0,
         }
     except Exception as e:
         return {
             "occupancy": 0,
             "room_temperature": None,
             "people_clusters": [],
+            "fever_count": 0,
+            "any_fever": False,
             "error": str(e),
         }
 
@@ -287,6 +367,8 @@ def save_occupancy_data(occupancy_result: dict) -> None:
                 else None
             ),
             "people_clusters": convert_numpy_types(occupancy_result.get("people_clusters", [])),
+            "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "any_fever": bool(occupancy_result.get("any_fever", False)),
         }
         line = json.dumps(entry) + "\n"
         with open(path, "a") as f:
@@ -338,7 +420,7 @@ def list_sensors() -> dict:
 def get_thermal_history(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
     date: Optional[str] = Query(default=None, description="YYYYMMDD (optional)"),
-    limit: int = Query(default=1000, description="Max frames to return (1..1000)"),
+    limit: int = Query(default=10000, description="Max frames to return (1..10000)"),
     offset: int = Query(default=0, description="Number of matching frames to skip"),
     include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
 ) -> dict:
@@ -404,15 +486,39 @@ def test() -> dict:
     return {"status": "server is running", "time": datetime.now().isoformat()}
 
 
+def _maybe_update_thermal_background(sensor_id: str, temp_array_2d: np.ndarray, occupancy: int) -> None:
+    """Update per-sensor thermal background when room is empty for BACKGROUND_MIN_FRAMES_EMPTY consecutive frames."""
+    global thermal_background_by_sensor, empty_frame_count_by_sensor
+    if sensor_id not in empty_frame_count_by_sensor:
+        empty_frame_count_by_sensor[sensor_id] = 0
+    if occupancy > 0:
+        empty_frame_count_by_sensor[sensor_id] = 0
+        return
+    empty_frame_count_by_sensor[sensor_id] += 1
+    if empty_frame_count_by_sensor[sensor_id] < BACKGROUND_MIN_FRAMES_EMPTY:
+        return
+    empty_frame_count_by_sensor[sensor_id] = 0
+    alpha = BACKGROUND_ALPHA
+    if sensor_id not in thermal_background_by_sensor:
+        thermal_background_by_sensor[sensor_id] = temp_array_2d.copy().astype(np.float64)
+    else:
+        thermal_background_by_sensor[sensor_id] = (
+            alpha * thermal_background_by_sensor[sensor_id] + (1.0 - alpha) * temp_array_2d
+        ).astype(np.float64)
+    _save_thermal_background(sensor_id)
+
+
 @app.post("/api/thermal")
 def receive_thermal_data(data: dict) -> dict:
     """Receive thermal data from ESP32 (compact or expanded format)."""
     global latest_thermal_data, last_update_time, latest_occupancy
     if not data:
         raise HTTPException(status_code=400, detail="No data received")
-    compact_data = dict(data)
     sensor_id = data.get("sensor_id") or "unknown"
+    if sensor_id not in thermal_background_by_sensor:
+        _load_thermal_background(sensor_id)
     if "t" in data:
+        compact_data = dict(data)
         try:
             expanded_data = expand_thermal_data(data)
         except Exception as e:
@@ -421,8 +527,14 @@ def receive_thermal_data(data: dict) -> dict:
         latest_thermal_data = expanded_data
     else:
         latest_thermal_data = data if data.get("sensor_id") else {**data, "sensor_id": sensor_id}
-    occupancy_result = estimate_occupancy(data)
+        compact_data = collapse_to_compact(latest_thermal_data)
+    occupancy_result = estimate_occupancy(data, sensor_id=sensor_id)
     occupancy_result["sensor_id"] = sensor_id
+    try:
+        temp_array_2d = thermal_data_to_array(data)
+        _maybe_update_thermal_background(sensor_id, temp_array_2d, occupancy_result["occupancy"])
+    except Exception:
+        pass
     latest_occupancy = occupancy_result
     now_iso = datetime.now().isoformat()
     last_update_time = now_iso
@@ -437,6 +549,8 @@ def receive_thermal_data(data: dict) -> dict:
         "status": "success",
         "received": pixel_count,
         "occupancy": occupancy_result["occupancy"],
+        "fever_count": occupancy_result.get("fever_count", 0),
+        "any_fever": occupancy_result.get("any_fever", False),
     }
 
 
@@ -455,6 +569,8 @@ def get_thermal_data(
         if occ:
             out["occupancy"] = occ.get("occupancy")
             out["room_temperature"] = occ.get("room_temperature")
+            out["fever_count"] = occ.get("fever_count", 0)
+            out["any_fever"] = occ.get("any_fever", False)
         return out
 
     if latest_thermal_data is None:
@@ -464,6 +580,8 @@ def get_thermal_data(
     if latest_occupancy:
         out["occupancy"] = latest_occupancy["occupancy"]
         out["room_temperature"] = latest_occupancy.get("room_temperature")
+        out["fever_count"] = latest_occupancy.get("fever_count", 0)
+        out["any_fever"] = latest_occupancy.get("any_fever", False)
     return out
 
 
@@ -546,6 +664,151 @@ def get_occupancy_stats(
         "avg_occupancy": round(sum(values) / len(values), 2),
         "current_occupancy": values[-1],
         "occupancy_distribution": dict(Counter(values)),
+    }
+
+
+def _compute_occupancy_trends(
+    date_str: str, sensor_id: Optional[str], bucket: str
+) -> List[dict]:
+    """Read occupancy log for date_str, bucket by hour or day, return list of bucket stats."""
+    path = DATA_DIR / f"occupancy_{date_str}.jsonl"
+    if not path.exists():
+        return []
+    buckets: Dict[Tuple, List[dict]] = {}
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if sensor_id is not None and entry.get("sensor_id") != sensor_id:
+                continue
+            ts_str = entry.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if bucket == "hour":
+                key = (dt.year, dt.month, dt.day, dt.hour)
+            else:
+                key = (dt.year, dt.month, dt.day)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(entry)
+    out = []
+    for key in sorted(buckets.keys()):
+        entries = buckets[key]
+        occupancies = [e["occupancy"] for e in entries]
+        room_temps = [e["room_temperature"] for e in entries if e.get("room_temperature") is not None]
+        if bucket == "hour":
+            y, m, d, h = key
+            bucket_start_dt = datetime(y, m, d, h, 0, 0)
+            bucket_end_dt = bucket_start_dt + timedelta(hours=1)
+            bucket_start = bucket_start_dt.isoformat()
+            bucket_end = bucket_end_dt.isoformat()
+        else:
+            y, m, d = key
+            bucket_start_dt = datetime(y, m, d, 0, 0, 0)
+            bucket_end_dt = bucket_start_dt + timedelta(days=1)
+            bucket_start = bucket_start_dt.isoformat()
+            bucket_end = bucket_end_dt.isoformat()
+        avg_room = round(sum(room_temps) / len(room_temps), 2) if room_temps else None
+        out.append({
+            "bucket_start": bucket_start,
+            "bucket_end": bucket_end,
+            "avg_occupancy": round(sum(occupancies) / len(occupancies), 2),
+            "max_occupancy": max(occupancies),
+            "sample_count": len(entries),
+            "avg_room_temperature": avg_room,
+        })
+    return out
+
+
+@app.get("/api/occupancy/trends")
+def get_occupancy_trends(
+    date: str = Query(default=None, description="YYYYMMDD (default: today)"),
+    sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
+    bucket: str = Query(default="hour", description="Aggregation bucket: hour | day"),
+) -> dict:
+    """Occupancy and room temperature aggregated by time bucket (hour or day)."""
+    date_str = date or datetime.now().strftime("%Y%m%d")
+    if bucket not in ("hour", "day"):
+        raise HTTPException(status_code=400, detail="bucket must be 'hour' or 'day'")
+    buckets_list = _compute_occupancy_trends(date_str, sensor_id, bucket)
+    return {
+        "date": date_str,
+        "sensor_id": sensor_id,
+        "bucket": bucket,
+        "count": len(buckets_list),
+        "data": buckets_list,
+    }
+
+
+def _predict_occupancy_heuristic(sensor_id: Optional[str], horizon_hours: int) -> List[dict]:
+    """Predict occupancy for next horizon_hours using same hour-of-day average over last 7 days."""
+    now = datetime.now()
+    # By hour-of-day (0..23), list of occupancy values from last 7 days
+    by_hour: Dict[int, List[int]] = {h: [] for h in range(24)}
+    for day_offset in range(1, 8):
+        d = now - timedelta(days=day_offset)
+        date_str = d.strftime("%Y%m%d")
+        path = DATA_DIR / f"occupancy_{date_str}.jsonl"
+        if not path.exists():
+            continue
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if sensor_id is not None and entry.get("sensor_id") != sensor_id:
+                    continue
+                ts_str = entry.get("timestamp")
+                if not ts_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                by_hour[dt.hour].append(entry["occupancy"])
+    # Average per hour-of-day (no data -> 0)
+    avg_by_hour: Dict[int, float] = {}
+    for h in range(24):
+        vals = by_hour[h]
+        avg_by_hour[h] = round(sum(vals) / len(vals), 2) if vals else 0.0
+    # Build prediction for next horizon_hours (starting at current hour)
+    out = []
+    for i in range(horizon_hours):
+        t = now + timedelta(hours=i)
+        h = t.hour
+        bucket_start = t.replace(minute=0, second=0, microsecond=0)
+        bucket_end = bucket_start + timedelta(hours=1)
+        out.append({
+            "bucket_start": bucket_start.isoformat(),
+            "bucket_end": bucket_end.isoformat(),
+            "expected_occupancy": avg_by_hour[h],
+        })
+    return out
+
+
+@app.get("/api/occupancy/predict")
+def get_occupancy_predict(
+    sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
+    horizon_hours: int = Query(default=24, ge=1, le=48, description="Number of hours to predict (1..48)"),
+) -> dict:
+    """Predicted occupancy for next hours based on same hour-of-day average over last 7 days (heuristic)."""
+    predictions = _predict_occupancy_heuristic(sensor_id, horizon_hours)
+    return {
+        "sensor_id": sensor_id,
+        "horizon_hours": horizon_hours,
+        "count": len(predictions),
+        "data": predictions,
     }
 
 
