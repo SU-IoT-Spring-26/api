@@ -35,7 +35,7 @@ def _get_blob_container():
     try:
         from azure.storage.blob import BlobServiceClient
 
-        container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "sensor-data")
+        container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME", "iotoccupancydata")
         blob_service = BlobServiceClient.from_connection_string(conn_str)
         _blob_container_client = blob_service.get_container_client(container_name)
         _blob_container_client.get_container_properties()  # verify access
