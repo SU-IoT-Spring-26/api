@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 env:
-  ACR_LOGIN_SERVER: myregistry.azurecr.io   # Change to <your-acr-name>.azurecr.io
+  ACR_LOGIN_SERVER: occupancyregistry.azurecr.io   # Change to <your-acr-name>.azurecr.io
   IMAGE_NAME: occupancy-api
 
 jobs:
