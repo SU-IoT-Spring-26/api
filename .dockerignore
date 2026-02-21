@@ -1,0 +1,33 @@
+# Git and IDE
+.git
+.gitignore
+.cursor
+*.md
+!scripts/README.md
+
+# Python
+.venv
+venv
+__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache
+.coverage
+htmlcov
+*.egg-info
+.eggs
+
+# Local data (don’t bake into image)
+thermal_data/
+*.npy
+
+# Tests and scripts (not needed in container)
+test_api.py
+scripts/
+
+# CI and deployment config (image is built elsewhere)
+.github
+
+# Misc
+LICENSE
+*.log
