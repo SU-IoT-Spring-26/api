@@ -26,6 +26,9 @@ jobs:
 
       - name: Azure Login
         uses: azure/login@v2
+
+         
+      - uses: azure/docker-login@v1
         with:
           client-id: ${{ secrets.OCCUPANCYAPICONTAINER_AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.OCCUPANCYAPICONTAINER_AZURE_TENANT_ID }}
@@ -45,5 +48,6 @@ jobs:
           imageToBuild: default/[parameters('containerAppName')]:${{ github.sha }}
           _buildArgumentsKey_: |
             _buildArgumentsValues_
+
 
 
