@@ -35,31 +35,103 @@ Or with port from environment (e.g. Azure sets `PORT`):
 PORT=8000 uvicorn main:app --host 0.0.0.0
 ```
 
-## Azure App Service
+## Docker
 
-- **Resource group:** `occupancy-rg`
-- **App Service:** `occupancy-api`
-
-**Startup command** (App Service → Configuration → General settings):
+Build and run locally:
 
 ```bash
-python main.py
+docker build -t occupancy-api .
+docker run -p 8000:8000 -e PORT=8000 occupancy-api
 ```
 
-This uses the `PORT` environment variable set by Azure (default 8000 when run locally).
-
-Alternative (fixed port):
+Optional: mount a host directory for persistent thermal/occupancy data:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+docker run -p 8000:8000 -e PORT=8000 \
+  -v "$(pwd)/thermal_data:/app/thermal_data" \
+  occupancy-api
 ```
 
-**Environment variables (optional):**
+The image uses `python main.py` so Azure’s `PORT` is respected when deployed.
 
-- `THERMAL_DATA_DIR` – directory for thermal and occupancy files (default: `thermal_data`)
+## Azure deployment (container)
+
+You can run the Docker image on **Azure App Service (Linux container)**, **Azure Container Apps**, or **Azure Container Instances**.
+
+### Option A: App Service with container
+
+1. **Build and push** the image to a registry (e.g. Azure Container Registry):
+
+   ```bash
+   az acr build --registry <your-acr-name> --image occupancy-api:latest .
+   ```
+
+2. In **App Service** → **Deployment Center** (or **Configuration** → **General settings**):
+   - Choose **Docker** → **Single Container**.
+   - Set **Registry source** to Azure Container Registry (or Docker Hub) and select `occupancy-api:latest`.
+   - Set **Target port** to **80** (App Service sets `PORT=80` by default; the app listens on whatever `PORT` is).
+
+3. Set **Application settings** (env vars): `AZURE_STORAGE_CONNECTION_STRING`, `THERMAL_DATA_DIR` (e.g. `/home/thermal_data` if using a mounted storage), and any of the optional variables listed below. App Service sets `PORT` automatically.
+
+4. **Persistent storage:** By default the container filesystem is ephemeral. For durable thermal/occupancy data either:
+   - Configure **Azure Blob** via `AZURE_STORAGE_CONNECTION_STRING` (recommended), or
+   - Use **App Service** → **Storage** to mount Azure Storage as a path (e.g. `/home/thermal_data`) and set `THERMAL_DATA_DIR=/home/thermal_data`.
+
+### Option B: Container Apps
+
+1. Build and push the image to ACR (or another registry).
+2. Create a Container App with the image. Set **Target port** to the value your platform uses for `PORT` (e.g. **80** for App Service, or **8000** if you set `PORT=8000` in app settings).
+3. Add the same environment variables; use Azure Blob for persistence or a volume mount if supported.
+
+### Option C: Auto-deploy container from GitHub
+
+A GitHub Actions workflow builds the Docker image, pushes it to Azure Container Registry (ACR), and deploys to App Service. Use the workflow in [.github/workflows/deploy-container.yml](.github/workflows/deploy-container.yml).
+
+**One-time setup**
+
+1. **Azure Container Registry**  
+   Create an ACR (e.g. in the same resource group as the app):
+   ```bash
+   az acr create --resource-group occupancy-rg --name myregistry --sku Basic --admin-enabled true
+   ```
+   Copy the **Login server** (e.g. `myregistry.azurecr.io`). In the repo, edit `.github/workflows/deploy-container.yml` and set `ACR_LOGIN_SERVER` to that value (e.g. `myregistry.azurecr.io`).
+
+2. **App Service as container**  
+   In Azure Portal → App Service **occupancy-api** → **Deployment Center** (or **Configuration** → **General settings**):
+   - **Publish:** Docker Container.
+   - **Registry:** Azure Container Registry; select your ACR and choose any image/tag for now (e.g. `occupancy-api:latest`). The workflow will overwrite it on each deploy.
+   - **Target port:** set to **80**. (App Service sets `PORT=80`; the app listens on that port.)
+   - Save. Ensure **Container settings** → **Startup Command** is empty (the image runs `python main.py`) or set to `python main.py`.
+
+3. **GitHub secrets**  
+   In the repo: **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
+   - `REGISTRY_USERNAME` – ACR **Username** (Azure Portal → ACR → **Access keys**).
+   - `REGISTRY_PASSWORD` – ACR **password** (from the same **Access keys** blade).
+   - `AZURE_CREDENTIALS` – service principal JSON so the workflow can update the App Service container. **Creating the SP and role assignment requires “Owner” or “User Access administrator” on the subscription or resource group.** If you get `AuthorizationFailed` on role assignment, ask an admin to run the steps below and share the JSON (or the `appId`/`password`/`tenant` values) with you.
+     **Option A – You have permission:** Create the SP (no deprecated flags):
+     ```bash
+     SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+     az ad sp create-for-rbac --name "github-occupancy-api" --role contributor \
+       --scopes /subscriptions/$SUBSCRIPTION_ID/resourceGroups/occupancy-rg
+     ```
+     From the output, build the secret value as one line (replace placeholders with the command output):
+     ```json
+     {"clientId":"<appId>","clientSecret":"<password>","subscriptionId":"<SUBSCRIPTION_ID>","tenantId":"<tenant>"}
+     ```
+     **Option B – Admin runs it:** An Owner/User Access admin runs the same `az ad sp create-for-rbac` command (no `--sdk-auth`), then builds the JSON above from `appId`, `password`, `tenant`, and your subscription ID, and gives you that JSON to store as `AZURE_CREDENTIALS`.
+
+4. **Optional:** Add application settings (env vars) in App Service → **Configuration** → **Application settings**, e.g. `AZURE_STORAGE_CONNECTION_STRING`, `THERMAL_DATA_DIR`, etc.
+
+After this, every push to `main` (or a manual **Run workflow** from the Actions tab) will build the image, push to ACR, and deploy to the Web App.
+
+### Environment variables (container / Azure)
+
+Set in App Service **Configuration** → **Application settings**, or as `-e` when running Docker locally:
+
+- `THERMAL_DATA_DIR` – directory for thermal and occupancy files (default: `thermal_data`; in the image: `/app/thermal_data`)
 - `SAVE_THERMAL_DATA` – set to `false` to disable saving (default: `true`)
-- `PORT` – port to bind (Azure sets this automatically)
-- `AZURE_STORAGE_CONNECTION_STRING` – if set, thermal and occupancy data are also written to Azure Blob Storage (in addition to local disk)
+- `PORT` – port to bind (Azure sets this automatically; default 8000 in the image)
+- `AZURE_STORAGE_CONNECTION_STRING` – if set, thermal and occupancy data are also written to Azure Blob Storage
 - `AZURE_STORAGE_CONTAINER_NAME` – blob container name (default: `iotoccupancydata`)
 - `BACKGROUND_ALPHA` – EMA weight for thermal background (default: `0.95`)
 - `BACKGROUND_MIN_FRAMES_EMPTY` – consecutive empty frames before updating background (default: `3`)
