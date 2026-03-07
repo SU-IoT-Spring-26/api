@@ -7,6 +7,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 
 import json
 import os
+import pyodbc
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +88,8 @@ app.add_middleware(
 # Configuration
 DATA_DIR = Path(os.environ.get("THERMAL_DATA_DIR", "thermal_data"))
 SAVE_DATA = os.environ.get("SAVE_THERMAL_DATA", "true").lower() in ("1", "true", "yes")
+SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
+SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
 
 # Occupancy detection parameters
 MIN_HUMAN_TEMP = 30.0
@@ -316,6 +319,72 @@ def convert_numpy_types(obj: Any) -> Any:
         return tuple(convert_numpy_types(x) for x in obj)
     return obj
 
+def _get_sql_connection():
+    """Create Azure SQL connection. Returns None if not configured."""
+    if not SQL_CONNECTION_STRING:
+        return None
+    try:
+        return pyodbc.connect(SQL_CONNECTION_STRING, timeout=10)
+    except Exception as e:
+        print(f"Azure SQL connection failed: {e}")
+        return None
+
+
+def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str] = None) -> None:
+    """Save occupancy estimation to Azure SQL."""
+    if not SAVE_TO_SQL:
+        return
+
+    conn = _get_sql_connection()
+    if conn is None:
+        return
+
+    try:
+        sid = occupancy_result.get("sensor_id") or "unknown"
+        ts = timestamp_iso or datetime.now().isoformat()
+
+        entry = {
+            "timestamp": ts,
+            "sensor_id": sid,
+            "occupancy": int(occupancy_result["occupancy"]),
+            "room_temperature": (
+                float(occupancy_result["room_temperature"])
+                if occupancy_result.get("room_temperature") is not None
+                else None
+            ),
+            "people_clusters": json.dumps(
+                convert_numpy_types(occupancy_result.get("people_clusters", []))
+            ),
+            "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "any_fever": bool(occupancy_result.get("any_fever", False)),
+        }
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO occupancy_data
+            ([timestamp], sensor_id, occupancy, room_temperature,
+             people_clusters, fever_count, any_fever)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            entry["timestamp"],
+            entry["sensor_id"],
+            entry["occupancy"],
+            entry["room_temperature"],
+            entry["people_clusters"],
+            entry["fever_count"],
+            1 if entry["any_fever"] else 0,
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving occupancy data to Azure SQL: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def save_thermal_data(
     compact_data: dict, expanded_data: dict, sensor_id: Optional[str] = None
@@ -544,6 +613,7 @@ def receive_thermal_data(data: dict) -> dict:
     last_update_time_by_sensor[sensor_id] = now_iso
     save_thermal_data(compact_data, latest_thermal_data, sensor_id)
     save_occupancy_data(occupancy_result)
+    save_occupancy_data_sql(occupancy_result, timestamp_iso=now_iso)
     pixel_count = len(latest_thermal_data.get("pixels", []))
     return {
         "status": "success",
