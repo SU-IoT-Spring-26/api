@@ -7,7 +7,6 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 
 import json
 import os
-import pyodbc
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,6 +20,10 @@ from scipy.ndimage import label
 # Optional Azure Blob Storage (only used if AZURE_STORAGE_CONNECTION_STRING is set)
 # _blob_container_client: container client if connected, False if init failed, None if not tried
 _blob_container_client: Any = None
+
+# Optional Azure SQL connection cache.
+# None = not yet attempted, False = permanently disabled (misconfiguration or import error), object = live connection
+_sql_connection: Any = None
 
 
 def _get_blob_container():
@@ -320,18 +323,41 @@ def convert_numpy_types(obj: Any) -> Any:
     return obj
 
 def _get_sql_connection():
-    """Create Azure SQL connection. Returns None if not configured."""
+    """Return a cached Azure SQL connection. Returns None if not configured or permanently disabled."""
+    global _sql_connection
+    if _sql_connection is False:
+        return None  # permanently disabled after earlier failure
+    if _sql_connection is not None:
+        try:
+            # Lightweight connectivity check at the ODBC driver level (no query sent to server).
+            _sql_connection.getinfo(2)  # SQL_DATA_SOURCE_NAME
+            return _sql_connection
+        except Exception:
+            _sql_connection = None  # stale, attempt to reconnect below
+
     if not SQL_CONNECTION_STRING:
         return None
+
     try:
-        return pyodbc.connect(SQL_CONNECTION_STRING, timeout=10)
+        import pyodbc  # noqa: PLC0415 – intentionally deferred for optional dependency
+    except ImportError:
+        print("pyodbc is not installed; Azure SQL saving disabled.")
+        _sql_connection = False
+        return None
+
+    try:
+        conn = pyodbc.connect(SQL_CONNECTION_STRING, timeout=10)
+        _sql_connection = conn
+        return _sql_connection
     except Exception as e:
-        print(f"Azure SQL connection failed: {e}")
+        print(f"Azure SQL connection failed ({type(e).__name__}); SQL saving disabled.")
+        _sql_connection = False
         return None
 
 
 def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str] = None) -> None:
     """Save occupancy estimation to Azure SQL."""
+    global _sql_connection
     if not SAVE_TO_SQL:
         return
 
@@ -339,6 +365,7 @@ def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str]
     if conn is None:
         return
 
+    cursor = None
     try:
         sid = occupancy_result.get("sensor_id") or "unknown"
         ts = timestamp_iso or datetime.now().isoformat()
@@ -376,14 +403,20 @@ def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str]
             1 if entry["any_fever"] else 0,
         )
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
-        print(f"Error saving occupancy data to Azure SQL: {e}")
+        print(f"Error saving occupancy data to Azure SQL ({type(e).__name__}); will retry on next call.")
         try:
-            conn.close()
+            conn.rollback()
         except Exception:
             pass
+        # Invalidate the cached connection so the next call will reconnect
+        _sql_connection = None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
 
 def save_thermal_data(
