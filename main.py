@@ -21,6 +21,10 @@ from scipy.ndimage import label
 # _blob_container_client: container client if connected, False if init failed, None if not tried
 _blob_container_client: Any = None
 
+# Optional Azure SQL connection cache.
+# None = not yet attempted, False = permanently disabled (misconfiguration or import error), object = live connection
+_sql_connection: Any = None
+
 
 def _get_blob_container():
     """Lazy-init Azure Blob container client from env. Returns None if not configured or init failed."""
@@ -87,6 +91,8 @@ app.add_middleware(
 # Configuration
 DATA_DIR = Path(os.environ.get("THERMAL_DATA_DIR", "thermal_data"))
 SAVE_DATA = os.environ.get("SAVE_THERMAL_DATA", "true").lower() in ("1", "true", "yes")
+SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
+SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
 
 # Occupancy detection parameters
 MIN_HUMAN_TEMP = 30.0
@@ -316,6 +322,102 @@ def convert_numpy_types(obj: Any) -> Any:
         return tuple(convert_numpy_types(x) for x in obj)
     return obj
 
+def _get_sql_connection():
+    """Return a cached Azure SQL connection. Returns None if not configured or permanently disabled."""
+    global _sql_connection
+    if _sql_connection is False:
+        return None  # permanently disabled after earlier failure
+    if _sql_connection is not None:
+        try:
+            # Lightweight connectivity check at the ODBC driver level (no query sent to server).
+            _sql_connection.getinfo(2)  # SQL_DATA_SOURCE_NAME
+            return _sql_connection
+        except Exception:
+            _sql_connection = None  # stale, attempt to reconnect below
+
+    if not SQL_CONNECTION_STRING:
+        return None
+
+    try:
+        import pyodbc  # noqa: PLC0415 – intentionally deferred for optional dependency
+    except ImportError:
+        print("pyodbc is not installed; Azure SQL saving disabled.")
+        _sql_connection = False
+        return None
+
+    try:
+        conn = pyodbc.connect(SQL_CONNECTION_STRING, timeout=10)
+        _sql_connection = conn
+        return _sql_connection
+    except Exception as e:
+        print(f"Azure SQL connection failed ({type(e).__name__}); SQL saving disabled.")
+        _sql_connection = False
+        return None
+
+
+def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str] = None) -> None:
+    """Save occupancy estimation to Azure SQL."""
+    global _sql_connection
+    if not SAVE_TO_SQL:
+        return
+
+    conn = _get_sql_connection()
+    if conn is None:
+        return
+
+    cursor = None
+    try:
+        sid = occupancy_result.get("sensor_id") or "unknown"
+        ts = timestamp_iso or datetime.now().isoformat()
+
+        entry = {
+            "timestamp": ts,
+            "sensor_id": sid,
+            "occupancy": int(occupancy_result["occupancy"]),
+            "room_temperature": (
+                float(occupancy_result["room_temperature"])
+                if occupancy_result.get("room_temperature") is not None
+                else None
+            ),
+            "people_clusters": json.dumps(
+                convert_numpy_types(occupancy_result.get("people_clusters", []))
+            ),
+            "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "any_fever": bool(occupancy_result.get("any_fever", False)),
+        }
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO occupancy_data
+            ([timestamp], sensor_id, occupancy, room_temperature,
+             people_clusters, fever_count, any_fever)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            entry["timestamp"],
+            entry["sensor_id"],
+            entry["occupancy"],
+            entry["room_temperature"],
+            entry["people_clusters"],
+            entry["fever_count"],
+            1 if entry["any_fever"] else 0,
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving occupancy data to Azure SQL ({type(e).__name__}); will retry on next call.")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        # Invalidate the cached connection so the next call will reconnect
+        _sql_connection = None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
 
 def save_thermal_data(
     compact_data: dict, expanded_data: dict, sensor_id: Optional[str] = None
@@ -544,6 +646,7 @@ def receive_thermal_data(data: dict) -> dict:
     last_update_time_by_sensor[sensor_id] = now_iso
     save_thermal_data(compact_data, latest_thermal_data, sensor_id)
     save_occupancy_data(occupancy_result)
+    save_occupancy_data_sql(occupancy_result, timestamp_iso=now_iso)
     pixel_count = len(latest_thermal_data.get("pixels", []))
     return {
         "status": "success",
