@@ -7,7 +7,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 
 import json
 import os
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -99,14 +99,29 @@ MIN_HUMAN_TEMP = 30.0
 MAX_HUMAN_TEMP = 45.0
 MIN_CLUSTER_SIZE = 3
 MAX_CLUSTER_SIZE = 200
-ROOM_TEMP_THRESHOLD = 0.5
+ROOM_TEMP_THRESHOLD = float(os.environ.get("ROOM_TEMP_THRESHOLD", "0.5"))
 FEVER_THRESHOLD_C = float(os.environ.get("FEVER_THRESHOLD_C", "37.5"))
+FEVER_ELEVATED_THRESHOLD_C = float(os.environ.get("FEVER_ELEVATED_THRESHOLD_C", "37.0"))
+FEVER_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("FEVER_MIN_CONSECUTIVE_FRAMES", "2")))
+
+# Temporal occupancy smoothing and frame sanity (no ground truth required)
+OCCUPANCY_SMOOTH_WINDOW = max(1, int(os.environ.get("OCCUPANCY_SMOOTH_WINDOW", "5")))
+OCCUPANCY_HYSTERESIS_DELTA = max(0, int(os.environ.get("OCCUPANCY_HYSTERESIS_DELTA", "1")))
+FRAME_ROOM_MEDIAN_MAX_JUMP_C = float(os.environ.get("FRAME_ROOM_MEDIAN_MAX_JUMP_C", "4.0"))
+BACKGROUND_MAX_MEAN_ABS_DELTA_C = float(os.environ.get("BACKGROUND_MAX_MEAN_ABS_DELTA_C", "2.5"))
 
 # Background subtraction (thermal): per-sensor background, updated when room empty
 BACKGROUND_ALPHA = float(os.environ.get("BACKGROUND_ALPHA", "0.95"))  # EMA weight for existing background
 BACKGROUND_MIN_FRAMES_EMPTY = int(os.environ.get("BACKGROUND_MIN_FRAMES_EMPTY", "3"))  # Consecutive empty frames to update
 thermal_background_by_sensor: Dict[str, np.ndarray] = {}
 empty_frame_count_by_sensor: Dict[str, int] = {}
+last_empty_frame_thermal_by_sensor: Dict[str, np.ndarray] = {}
+
+occupancy_raw_history_by_sensor: Dict[str, deque] = {}
+last_frame_median_by_sensor: Dict[str, float] = {}
+last_raw_occupancy_by_sensor: Dict[str, int] = {}
+last_smoothed_occupancy_by_sensor: Dict[str, int] = {}
+fever_consecutive_by_sensor: Dict[str, int] = {}
 
 # In-memory latest state
 latest_thermal_data: Optional[dict] = None
@@ -200,7 +215,9 @@ def collapse_to_compact(expanded_data: dict) -> dict:
     """Convert expanded thermal data (pixels) to compact format (w, h, min, max, t)."""
     width = expanded_data["width"]
     height = expanded_data["height"]
-    pixels = expanded_data["pixels"]
+    pixels = expanded_data.get("pixels") or []
+    if not pixels:
+        raise ValueError("expanded thermal data has no pixels")
     # Row-major order (same as expand_thermal_data: index = row * width + col)
     sorted_pixels = sorted(pixels, key=lambda p: (p["row"], p["col"]))
     t = [_parse_temperature(p["temp"]) for p in sorted_pixels]
@@ -214,6 +231,37 @@ def collapse_to_compact(expanded_data: dict) -> dict:
     if expanded_data.get("sensor_id") is not None:
         out["sensor_id"] = expanded_data["sensor_id"]
     return out
+
+
+def _validate_thermal_payload(data: dict) -> None:
+    """Reject malformed frames before processing (avoids crashes on empty or length-mismatch data)."""
+    if "t" in data:
+        if "w" not in data or "h" not in data:
+            raise ValueError("compact thermal data must include w and h")
+        w, h = int(data["w"]), int(data["h"])
+        t = data.get("t")
+        if t is None:
+            raise ValueError("compact thermal data must include t")
+        if len(t) == 0:
+            raise ValueError("compact thermal data has an empty temperature array")
+        if w <= 0 or h <= 0:
+            raise ValueError("invalid thermal dimensions")
+        if len(t) != w * h:
+            raise ValueError("compact thermal data length does not match w*h")
+        return
+    if "pixels" in data:
+        if "width" not in data or "height" not in data:
+            raise ValueError("expanded thermal data must include width and height")
+        w, h = int(data["width"]), int(data["height"])
+        pixels = data.get("pixels") or []
+        if w <= 0 or h <= 0:
+            raise ValueError("invalid thermal dimensions")
+        if len(pixels) == 0:
+            raise ValueError("expanded thermal data has an empty pixels array")
+        if len(pixels) != w * h:
+            raise ValueError("expanded thermal pixel count does not match width*height")
+        return
+    raise ValueError("unknown thermal data format")
 
 
 def thermal_data_to_array(data: dict) -> np.ndarray:
@@ -233,11 +281,20 @@ def estimate_room_temperature(temp_array: np.ndarray) -> float:
 
 
 def detect_human_heat(
-    temp_array: np.ndarray, room_temp: float, use_delta: bool = False
+    temp_array: np.ndarray,
+    room_temp: float,
+    use_delta: bool = False,
+    absolute_temp_array: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Human heat mask. If use_delta True, temp_array is delta above background (same-threshold interpretation)."""
+    """Human heat mask.
+
+    If ``use_delta`` is True, ``temp_array`` is delta above background. The upper bound
+    must apply to **absolute** temperature (human bodies are not hotter than ``MAX_HUMAN_TEMP``);
+    otherwise a hot object (e.g. 60 °C) can produce a delta below 45 °C and be mistaken for a person.
+    """
     if use_delta:
-        human_mask = (temp_array >= ROOM_TEMP_THRESHOLD) & (temp_array <= MAX_HUMAN_TEMP)
+        abs_arr = absolute_temp_array if absolute_temp_array is not None else temp_array
+        human_mask = (temp_array >= ROOM_TEMP_THRESHOLD) & (abs_arr <= MAX_HUMAN_TEMP)
     else:
         human_mask = (temp_array >= MIN_HUMAN_TEMP) & (temp_array <= MAX_HUMAN_TEMP)
         relative_mask = (temp_array - room_temp) >= ROOM_TEMP_THRESHOLD
@@ -258,11 +315,17 @@ def find_people_clusters(human_mask: np.ndarray, temp_array: np.ndarray) -> List
             cluster_temps = temp_array[cluster_pixels[0], cluster_pixels[1]]
             representative_temp_c = float(np.percentile(cluster_temps, 90)) if cluster_temps.size else 0.0
             fever_detected = representative_temp_c >= FEVER_THRESHOLD_C
+            elevated_temp = (
+                FEVER_ELEVATED_THRESHOLD_C > 0
+                and representative_temp_c >= FEVER_ELEVATED_THRESHOLD_C
+                and representative_temp_c < FEVER_THRESHOLD_C
+            )
             people_clusters.append({
                 "id": i,
                 "size": cluster_size,
                 "center": (center_row, center_col),
                 "representative_temp_c": round(representative_temp_c, 2),
+                "elevated_temp": elevated_temp,
                 "fever_detected": fever_detected,
             })
     return people_clusters
@@ -280,15 +343,23 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
                 delta = np.maximum(0.0, temp_array_2d - background)
                 array_for_detection = delta
                 use_delta = True
-        human_mask = detect_human_heat(array_for_detection, room_temp, use_delta=use_delta)
+        human_mask = detect_human_heat(
+            array_for_detection,
+            room_temp,
+            use_delta=use_delta,
+            absolute_temp_array=temp_array_2d if use_delta else None,
+        )
         people_clusters = find_people_clusters(human_mask, temp_array_2d)
         fever_count = sum(1 for c in people_clusters if c.get("fever_detected"))
+        elevated_count = sum(1 for c in people_clusters if c.get("elevated_temp"))
         return {
             "occupancy": len(people_clusters),
             "room_temperature": room_temp,
             "people_clusters": people_clusters,
             "fever_count": fever_count,
+            "elevated_count": elevated_count,
             "any_fever": fever_count > 0,
+            "any_elevated": elevated_count > 0,
         }
     except Exception as e:
         return {
@@ -296,9 +367,70 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
             "room_temperature": None,
             "people_clusters": [],
             "fever_count": 0,
+            "elevated_count": 0,
             "any_fever": False,
+            "any_elevated": False,
             "error": str(e),
         }
+
+
+def apply_occupancy_signal_processing(
+    sensor_id: str, occupancy_result: dict, temp_array_2d: np.ndarray
+) -> None:
+    """
+    Mutates occupancy_result in place: frame sanity (median jump), temporal median smoothing,
+    hysteresis, and consecutive-frame fever gating. Does not re-run clustering.
+    """
+    instant_from_model = int(occupancy_result["occupancy"])
+    frame_median = float(np.median(temp_array_2d))
+    frame_valid = True
+    if FRAME_ROOM_MEDIAN_MAX_JUMP_C > 0 and sensor_id in last_frame_median_by_sensor:
+        if abs(frame_median - last_frame_median_by_sensor[sensor_id]) > FRAME_ROOM_MEDIAN_MAX_JUMP_C:
+            frame_valid = False
+
+    last_frame_median_by_sensor[sensor_id] = frame_median
+
+    if frame_valid:
+        effective_raw = instant_from_model
+        last_raw_occupancy_by_sensor[sensor_id] = instant_from_model
+    else:
+        effective_raw = last_raw_occupancy_by_sensor.get(sensor_id, instant_from_model)
+
+    occupancy_result["occupancy_raw_instant"] = instant_from_model
+    occupancy_result["occupancy_effective_raw"] = effective_raw
+    occupancy_result["frame_valid"] = frame_valid
+
+    maxlen = OCCUPANCY_SMOOTH_WINDOW
+    if sensor_id not in occupancy_raw_history_by_sensor:
+        occupancy_raw_history_by_sensor[sensor_id] = deque(maxlen=maxlen)
+    occupancy_raw_history_by_sensor[sensor_id].append(effective_raw)
+
+    window = list(occupancy_raw_history_by_sensor[sensor_id])
+    cand = int(round(float(np.median(window))))
+
+    prev_s = last_smoothed_occupancy_by_sensor.get(sensor_id)
+    if prev_s is not None and OCCUPANCY_HYSTERESIS_DELTA > 0:
+        if abs(cand - prev_s) <= OCCUPANCY_HYSTERESIS_DELTA and cand != prev_s:
+            smoothed = prev_s
+        else:
+            smoothed = cand
+    else:
+        smoothed = cand
+    last_smoothed_occupancy_by_sensor[sensor_id] = smoothed
+    occupancy_result["occupancy"] = smoothed
+
+    any_fever_raw = bool(occupancy_result.get("any_fever", False))
+    if any_fever_raw:
+        fever_consecutive_by_sensor[sensor_id] = fever_consecutive_by_sensor.get(sensor_id, 0) + 1
+    else:
+        fever_consecutive_by_sensor[sensor_id] = 0
+    streak = fever_consecutive_by_sensor[sensor_id]
+    occupancy_result["fever_consecutive_frames"] = streak
+    occupancy_result["any_fever_raw"] = any_fever_raw
+    if streak >= FEVER_MIN_CONSECUTIVE_FRAMES:
+        occupancy_result["any_fever"] = True
+    else:
+        occupancy_result["any_fever"] = False
 
 
 def _sanitize_sensor_id_for_filename(sensor_id: Optional[str]) -> str:
@@ -463,6 +595,10 @@ def save_occupancy_data(occupancy_result: dict) -> None:
             "timestamp": timestamp.isoformat(),
             "sensor_id": sid,
             "occupancy": int(occupancy_result["occupancy"]),
+            "occupancy_raw_instant": int(occupancy_result.get("occupancy_raw_instant", occupancy_result["occupancy"])),
+            "occupancy_effective_raw": int(
+                occupancy_result.get("occupancy_effective_raw", occupancy_result["occupancy"])
+            ),
             "room_temperature": (
                 float(occupancy_result["room_temperature"])
                 if occupancy_result.get("room_temperature") is not None
@@ -470,7 +606,12 @@ def save_occupancy_data(occupancy_result: dict) -> None:
             ),
             "people_clusters": convert_numpy_types(occupancy_result.get("people_clusters", [])),
             "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "elevated_count": int(occupancy_result.get("elevated_count", 0)),
             "any_fever": bool(occupancy_result.get("any_fever", False)),
+            "any_fever_raw": bool(occupancy_result.get("any_fever_raw", occupancy_result.get("any_fever", False))),
+            "any_elevated": bool(occupancy_result.get("any_elevated", False)),
+            "fever_consecutive_frames": int(occupancy_result.get("fever_consecutive_frames", 0)),
+            "frame_valid": bool(occupancy_result.get("frame_valid", True)),
         }
         line = json.dumps(entry) + "\n"
         with open(path, "a") as f:
@@ -588,14 +729,28 @@ def test() -> dict:
     return {"status": "server is running", "time": datetime.now().isoformat()}
 
 
-def _maybe_update_thermal_background(sensor_id: str, temp_array_2d: np.ndarray, occupancy: int) -> None:
-    """Update per-sensor thermal background when room is empty for BACKGROUND_MIN_FRAMES_EMPTY consecutive frames."""
+def _maybe_update_thermal_background(sensor_id: str, temp_array_2d: np.ndarray, occupancy_effective_raw: int) -> None:
+    """
+    Update per-sensor thermal background when room is empty (effective raw occupancy 0).
+    Requires BACKGROUND_MIN_FRAMES_EMPTY consecutive stable empty frames (low frame-to-frame change).
+    """
     global thermal_background_by_sensor, empty_frame_count_by_sensor
     if sensor_id not in empty_frame_count_by_sensor:
         empty_frame_count_by_sensor[sensor_id] = 0
-    if occupancy > 0:
+    if occupancy_effective_raw > 0:
         empty_frame_count_by_sensor[sensor_id] = 0
         return
+
+    if BACKGROUND_MAX_MEAN_ABS_DELTA_C > 0 and sensor_id in last_empty_frame_thermal_by_sensor:
+        prev = last_empty_frame_thermal_by_sensor[sensor_id]
+        if prev.shape == temp_array_2d.shape:
+            mad = float(np.mean(np.abs(temp_array_2d - prev)))
+            if mad > BACKGROUND_MAX_MEAN_ABS_DELTA_C:
+                empty_frame_count_by_sensor[sensor_id] = 1
+                last_empty_frame_thermal_by_sensor[sensor_id] = temp_array_2d.copy().astype(np.float64)
+                return
+
+    last_empty_frame_thermal_by_sensor[sensor_id] = temp_array_2d.copy().astype(np.float64)
     empty_frame_count_by_sensor[sensor_id] += 1
     if empty_frame_count_by_sensor[sensor_id] < BACKGROUND_MIN_FRAMES_EMPTY:
         return
@@ -616,6 +771,10 @@ def receive_thermal_data(data: dict) -> dict:
     global latest_thermal_data, last_update_time, latest_occupancy
     if not data:
         raise HTTPException(status_code=400, detail="No data received")
+    try:
+        _validate_thermal_payload(data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     sensor_id = data.get("sensor_id") or "unknown"
     if sensor_id not in thermal_background_by_sensor:
         _load_thermal_background(sensor_id)
@@ -629,12 +788,18 @@ def receive_thermal_data(data: dict) -> dict:
         latest_thermal_data = expanded_data
     else:
         latest_thermal_data = data if data.get("sensor_id") else {**data, "sensor_id": sensor_id}
-        compact_data = collapse_to_compact(latest_thermal_data)
+        try:
+            compact_data = collapse_to_compact(latest_thermal_data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     occupancy_result = estimate_occupancy(data, sensor_id=sensor_id)
     occupancy_result["sensor_id"] = sensor_id
     try:
         temp_array_2d = thermal_data_to_array(data)
-        _maybe_update_thermal_background(sensor_id, temp_array_2d, occupancy_result["occupancy"])
+        apply_occupancy_signal_processing(sensor_id, occupancy_result, temp_array_2d)
+        _maybe_update_thermal_background(
+            sensor_id, temp_array_2d, int(occupancy_result.get("occupancy_effective_raw", 0))
+        )
     except Exception:
         pass
     latest_occupancy = occupancy_result
@@ -652,8 +817,15 @@ def receive_thermal_data(data: dict) -> dict:
         "status": "success",
         "received": pixel_count,
         "occupancy": occupancy_result["occupancy"],
+        "occupancy_raw_instant": occupancy_result.get("occupancy_raw_instant", occupancy_result["occupancy"]),
+        "occupancy_effective_raw": occupancy_result.get("occupancy_effective_raw", occupancy_result["occupancy"]),
+        "frame_valid": occupancy_result.get("frame_valid", True),
         "fever_count": occupancy_result.get("fever_count", 0),
+        "elevated_count": occupancy_result.get("elevated_count", 0),
         "any_fever": occupancy_result.get("any_fever", False),
+        "any_fever_raw": occupancy_result.get("any_fever_raw", False),
+        "any_elevated": occupancy_result.get("any_elevated", False),
+        "fever_consecutive_frames": occupancy_result.get("fever_consecutive_frames", 0),
     }
 
 
@@ -671,9 +843,16 @@ def get_thermal_data(
         occ = latest_occupancy_by_sensor.get(sensor_id)
         if occ:
             out["occupancy"] = occ.get("occupancy")
+            out["occupancy_raw_instant"] = occ.get("occupancy_raw_instant", occ.get("occupancy"))
+            out["occupancy_effective_raw"] = occ.get("occupancy_effective_raw", occ.get("occupancy"))
+            out["frame_valid"] = occ.get("frame_valid", True)
             out["room_temperature"] = occ.get("room_temperature")
             out["fever_count"] = occ.get("fever_count", 0)
+            out["elevated_count"] = occ.get("elevated_count", 0)
             out["any_fever"] = occ.get("any_fever", False)
+            out["any_fever_raw"] = occ.get("any_fever_raw", False)
+            out["any_elevated"] = occ.get("any_elevated", False)
+            out["fever_consecutive_frames"] = occ.get("fever_consecutive_frames", 0)
         return out
 
     if latest_thermal_data is None:
@@ -682,9 +861,18 @@ def get_thermal_data(
     out["last_update"] = last_update_time
     if latest_occupancy:
         out["occupancy"] = latest_occupancy["occupancy"]
+        out["occupancy_raw_instant"] = latest_occupancy.get("occupancy_raw_instant", latest_occupancy["occupancy"])
+        out["occupancy_effective_raw"] = latest_occupancy.get(
+            "occupancy_effective_raw", latest_occupancy["occupancy"]
+        )
+        out["frame_valid"] = latest_occupancy.get("frame_valid", True)
         out["room_temperature"] = latest_occupancy.get("room_temperature")
         out["fever_count"] = latest_occupancy.get("fever_count", 0)
+        out["elevated_count"] = latest_occupancy.get("elevated_count", 0)
         out["any_fever"] = latest_occupancy.get("any_fever", False)
+        out["any_fever_raw"] = latest_occupancy.get("any_fever_raw", False)
+        out["any_elevated"] = latest_occupancy.get("any_elevated", False)
+        out["fever_consecutive_frames"] = latest_occupancy.get("fever_consecutive_frames", 0)
     return out
 
 
@@ -704,18 +892,17 @@ def get_all_thermal_data() -> dict:
     return result
 
 
-# TODO: build actual prediction model
 @app.get("/api/thermal/predicted/poll")
 def get_predicted_thermal_data_poll(
     sensor_id: Optional[str] = Query(default=None, description="If set, return latest for this sensor_id"),
 ) -> dict:
-    """Return latest thermal data (expanded format with occupancy)."""
+    """Backward-compatible alias for ``GET /api/thermal/current/poll`` (latest reading, not a thermal forecast)."""
     return get_thermal_data(sensor_id)
 
 
 @app.get("/api/thermal/predicted/all")
 def get_predicted_thermal_data() -> dict:
-    """Return latest thermal data for all sensors."""
+    """Backward-compatible alias for ``GET /api/thermal/current/all`` (latest readings per sensor)."""
     return get_all_thermal_data()
 
 

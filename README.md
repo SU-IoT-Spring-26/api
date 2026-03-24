@@ -22,6 +22,8 @@ FastAPI service for receiving and storing thermal camera data from ESP32 devices
 
 ## Local run
 
+Create the virtualenv once, then **always** `source .venv/bin/activate` before `python`, `uvicorn`, or the scripts under `scripts/` (same shell session as the command you run).
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
@@ -32,6 +34,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 Or with port from environment (e.g. Azure sets `PORT`):
 
 ```bash
+source .venv/bin/activate
 PORT=8000 uvicorn main:app --host 0.0.0.0
 ```
 
@@ -135,7 +138,14 @@ Set in App Service **Configuration** → **Application settings**, or as `-e` wh
 - `AZURE_STORAGE_CONTAINER_NAME` – blob container name (default: `iotoccupancydata`)
 - `BACKGROUND_ALPHA` – EMA weight for thermal background (default: `0.95`)
 - `BACKGROUND_MIN_FRAMES_EMPTY` – consecutive empty frames before updating background (default: `3`)
+- `BACKGROUND_MAX_MEAN_ABS_DELTA_C` – max mean absolute frame delta (°C) between consecutive **empty** frames to count toward background update; larger motion resets the empty streak (default: `2.5`; `0` disables the check)
+- `ROOM_TEMP_THRESHOLD` – degrees (°C) above room estimate a pixel must be to count as human heat in delta mode (default: `0.5`)
 - `FEVER_THRESHOLD_C` – temperature (°C) above which a cluster is flagged as fever (default: `37.5`)
+- `FEVER_ELEVATED_THRESHOLD_C` – lower band: cluster max temp between this and fever threshold is counted as elevated (default: `37.0`)
+- `FEVER_MIN_CONSECUTIVE_FRAMES` – `any_fever` in API output is true only after this many consecutive frames with raw fever (default: `2`)
+- `OCCUPANCY_SMOOTH_WINDOW` – median smoothing length over effective raw occupancy (default: `5`)
+- `OCCUPANCY_HYSTERESIS_DELTA` – suppress small oscillations: changes smaller than this from last smoothed value are held (default: `1`)
+- `FRAME_ROOM_MEDIAN_MAX_JUMP_C` – if the full-frame median temperature jumps more than this (°C) vs the previous frame, the frame is treated invalid and raw occupancy falls back to the last good value; final `occupancy` still uses the smoother (default: `4.0`; `0` disables)
 
 ## Test
 
@@ -211,13 +221,33 @@ When the room is empty for several consecutive frames, the server updates a per-
 
 ### Fever detection
 
-Each detected person cluster gets a representative temperature (90th percentile of pixels in the cluster). Clusters above `FEVER_THRESHOLD_C` are flagged; responses include `fever_count`, `any_fever`, and per-cluster `representative_temp_c` / `fever_detected`. Stored in occupancy JSONL.
+Each detected person cluster gets a representative temperature (90th percentile of pixels in the cluster). Clusters with representative temp **between** `FEVER_ELEVATED_THRESHOLD_C` and `FEVER_THRESHOLD_C` are tagged `elevated_temp`; clusters at or above `FEVER_THRESHOLD_C` are raw fever candidates (`fever_count`, `any_fever_raw`). The public `any_fever` flag is gated: it becomes true only after `FEVER_MIN_CONSECUTIVE_FRAMES` consecutive frames with raw fever, to reduce single-frame noise. Responses and occupancy JSONL include `elevated_count`, `any_elevated`, `any_fever_raw`, and `fever_consecutive_frames` where applicable.
+
+### Occupancy signal processing (temporal)
+
+After clustering, the server applies **frame sanity**, **median smoothing**, and **hysteresis** before exposing `occupancy`:
+
+| Field | Meaning |
+|--------|--------|
+| `occupancy_raw_instant` | Person count from clustering this frame |
+| `occupancy_effective_raw` | Same as raw if the frame is valid; if the frame fails the median jump check, repeats the last good raw count |
+| `occupancy` | Smoothed + hysteresis output (what clients should use for stable room counts) |
+| `frame_valid` | False when the median temperature jump test rejected the frame |
+
+These fields are stored in daily `occupancy_YYYYMMDD.jsonl` and returned from `POST /api/thermal` and `GET /api/thermal` (latest).
 
 ### Trends and prediction
 
 - **`GET /api/occupancy/trends`** – Aggregates occupancy and room temperature by hour or day for a given date.
 - **`GET /api/occupancy/predict`** – Heuristic prediction for the next 1–48 hours using same hour-of-day average over the last 7 days.
 
-### Accuracy comparison
+### Ground truth and calibration
 
-See [scripts/README.md](scripts/README.md). Run `scripts/compare_occupancy_accuracy.py` with a ground-truth CSV to compute MAE and accuracy within 1 against local occupancy JSONL.
+With labeled data you can score stored logs or replay thermal archives:
+
+- **`scripts/compare_occupancy_accuracy.py`** – CSV `timestamp,sensor_id,actual_count` vs `occupancy_*.jsonl`. Options `--field` and `--compare-fields` let you compare smoothed `occupancy`, `occupancy_effective_raw`, or `occupancy_raw_instant`.
+- **`scripts/compare_fever_accuracy.py`** – CSV `timestamp,sensor_id,fever` (0/1) vs fever flags in JSONL (`any_fever`, `any_fever_raw`, or `fever_count_positive`).
+- **`scripts/replay_thermal_occupancy.py`** – Re-run `thermal_*_compact.json` through the pipeline offline (no writes by default); optional CSV export.
+- **`scripts/calibrate_occupancy_thresholds.py`** – Small grid over `ROOM_TEMP_THRESHOLD` / `MIN_CLUSTER_SIZE` using replay + the same alignment as the accuracy script.
+
+Details and examples: [scripts/README.md](scripts/README.md).
