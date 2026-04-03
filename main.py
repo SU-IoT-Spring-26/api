@@ -8,6 +8,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 import json
 import os
 from collections import Counter, deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,14 +77,20 @@ def _append_to_blob(blob_name: str, line: str) -> None:
     except Exception as e:
         print(f"Azure Blob append failed ({blob_name}): {e}")
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    _restore_state_from_disk()
+    yield
+
+
 app = FastAPI(
     title="Occupancy API",
     description="Receive and store thermal camera data; estimate and query occupancy.",
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 
-@app.on_event("startup")
 def _restore_state_from_disk() -> None:
     """Reload the most recent thermal frame and occupancy result per sensor from disk after a restart."""
     global latest_thermal_data, last_update_time, latest_occupancy
