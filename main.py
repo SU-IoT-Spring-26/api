@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from scipy.ndimage import label
 
 # Optional Azure Blob Storage (only used if AZURE_STORAGE_CONNECTION_STRING is set)
@@ -1100,6 +1101,186 @@ def get_occupancy_predict(
         "count": len(predictions),
         "data": predictions,
     }
+
+
+@app.get("/", response_class=HTMLResponse)
+def visualization_page() -> str:
+    """Live thermal visualization dashboard."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal Camera Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 24px; }
+  h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 16px; color: #f8fafc; }
+  .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  select { background: #1e2330; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 6px; padding: 6px 10px; font-size: 0.875rem; }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+  .badge-occ  { background: #1e40af; color: #bfdbfe; }
+  .badge-temp { background: #14532d; color: #bbf7d0; }
+  .badge-fever { background: #7f1d1d; color: #fecaca; }
+  .badge-elevated { background: #78350f; color: #fde68a; }
+  .badge-ok { background: #1e293b; color: #94a3b8; }
+  .canvas-wrap { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  canvas { image-rendering: pixelated; border: 1px solid #2d3748; border-radius: 4px; }
+  #legend { display: flex; flex-direction: column; gap: 4px; }
+  .legend-bar { width: 20px; height: 160px; border-radius: 3px; background: linear-gradient(to bottom, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff); }
+  .legend-label { font-size: 0.7rem; color: #94a3b8; }
+  #status { margin-top: 14px; font-size: 0.8rem; color: #64748b; }
+  .stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<h1>Thermal Camera Dashboard</h1>
+<div class="toolbar">
+  <label for="sensorSel" style="font-size:0.875rem;color:#94a3b8">Sensor:</label>
+  <select id="sensorSel"><option value="">— any —</option></select>
+  <label style="font-size:0.875rem;color:#94a3b8">
+    <input type="checkbox" id="showClusters" checked style="margin-right:4px">
+    Show people
+  </label>
+  <label style="font-size:0.875rem;color:#94a3b8">Scale:
+    <select id="scaleSel">
+      <option value="8">8×</option>
+      <option value="12" selected>12×</option>
+      <option value="16">16×</option>
+      <option value="20">20×</option>
+    </select>
+  </label>
+</div>
+<div class="stats" id="stats"></div>
+<div class="canvas-wrap">
+  <canvas id="thermal"></canvas>
+  <div id="legend">
+    <div class="legend-label" id="maxLabel">—</div>
+    <div class="legend-bar"></div>
+    <div class="legend-label" id="minLabel">—</div>
+  </div>
+</div>
+<div id="status">Connecting…</div>
+
+<script>
+const canvas = document.getElementById('thermal');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+const sensorSel = document.getElementById('sensorSel');
+const scaleSel = document.getElementById('scaleSel');
+const showClusters = document.getElementById('showClusters');
+
+let pollTimer = null;
+
+async function loadSensors() {
+  try {
+    const r = await fetch('/api/sensors');
+    const j = await r.json();
+    j.sensors.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = s;
+      sensorSel.appendChild(opt);
+    });
+  } catch(e) {}
+}
+
+function badge(cls, text) {
+  return `<span class="badge ${cls}">${text}</span>`;
+}
+
+function renderFrame(data) {
+  const scale = parseInt(scaleSel.value, 10);
+  const pixels = data.pixels || [];
+  if (!pixels.length) return;
+
+  const W = data.width, H = data.height;
+  canvas.width  = W * scale;
+  canvas.height = H * scale;
+
+  // Draw thermal pixels
+  pixels.forEach(p => {
+    ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`;
+    ctx.fillRect(p.col * scale, p.row * scale, scale, scale);
+  });
+
+  // Cluster overlays
+  if (showClusters.checked) {
+    const clusters = data.people_clusters || [];
+    clusters.forEach(c => {
+      const [row, col] = c.center;
+      const cx = col * scale + scale / 2;
+      const cy = row * scale + scale / 2;
+      const r  = Math.sqrt(c.size) * scale * 0.55;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.strokeStyle = c.fever_detected ? '#ff2222' : c.elevated_temp ? '#ffaa00' : '#00ff88';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // temp label
+      ctx.fillStyle = '#fff';
+      ctx.font = `bold ${Math.max(10, scale - 2)}px system-ui`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(c.representative_temp_c.toFixed(1) + '°', cx, cy);
+    });
+  }
+
+  // Legend
+  document.getElementById('maxLabel').textContent = data.max_temp?.toFixed(1) + ' °C';
+  document.getElementById('minLabel').textContent = data.min_temp?.toFixed(1) + ' °C';
+
+  // Stats badges
+  const occ  = data.occupancy ?? '—';
+  const temp = data.room_temperature != null ? data.room_temperature.toFixed(1) + ' °C' : '—';
+  const feverBadge = data.any_fever
+    ? badge('badge-fever', '🌡 Fever detected')
+    : data.any_elevated
+      ? badge('badge-elevated', '⚠ Elevated temp')
+      : badge('badge-ok', 'No fever');
+
+  statsEl.innerHTML =
+    badge('badge-occ',  `👤 ${occ} ${occ === 1 ? 'person' : 'people'}`) + ' ' +
+    badge('badge-temp', `🌡 Room ${temp}`) + ' ' +
+    feverBadge +
+    (data.frame_valid === false ? ' ' + badge('badge-elevated', 'Frame invalid') : '');
+
+  const ts = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '—';
+  statusEl.textContent = `Last update: ${ts}  ·  ${W}×${H} px`;
+}
+
+async function poll() {
+  const sid = sensorSel.value;
+  const url = '/api/thermal/current/poll' + (sid ? `?sensor_id=${encodeURIComponent(sid)}` : '');
+  try {
+    const r = await fetch(url);
+    if (r.status === 404) {
+      statusEl.textContent = 'No data yet — waiting for a sensor to post.';
+    } else if (!r.ok) {
+      statusEl.textContent = `Error ${r.status}`;
+    } else {
+      renderFrame(await r.json());
+    }
+  } catch(e) {
+    statusEl.textContent = `Fetch error: ${e.message}`;
+  }
+  pollTimer = setTimeout(poll, 2000);
+}
+
+function restart() {
+  clearTimeout(pollTimer);
+  poll();
+}
+
+sensorSel.addEventListener('change', restart);
+scaleSel.addEventListener('change', () => { /* re-render on next poll */ });
+showClusters.addEventListener('change', restart);
+
+loadSensors();
+poll();
+</script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":
