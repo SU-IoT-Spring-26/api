@@ -81,6 +81,71 @@ app = FastAPI(
     description="Receive and store thermal camera data; estimate and query occupancy.",
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+def _restore_state_from_disk() -> None:
+    """Reload the most recent thermal frame and occupancy result per sensor from disk after a restart."""
+    global latest_thermal_data, last_update_time, latest_occupancy
+
+    if not DATA_DIR.exists():
+        return
+
+    # --- Thermal frames: latest expanded file per sensor ---
+    # Files are named thermal_<safe_id>_<timestamp>_expanded.json; lexicographic sort == time order.
+    expanded_files = sorted(DATA_DIR.glob("thermal_*_expanded.json"), key=lambda p: p.name, reverse=True)
+    best_expanded: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, data)
+    for p in expanded_files:
+        try:
+            payload = json.loads(p.read_text())
+            sid = payload.get("sensor_id") or (payload.get("data") or {}).get("sensor_id")
+            if not sid or sid in best_expanded:
+                continue
+            ts = payload.get("timestamp", "")
+            best_expanded[sid] = (ts, payload)
+        except Exception:
+            continue
+
+    for sid, (ts, payload) in best_expanded.items():
+        data = payload.get("data") or {}
+        if not data.get("pixels"):
+            continue
+        latest_thermal_by_sensor[sid] = data
+        last_update_time_by_sensor[sid] = ts
+        if latest_thermal_data is None or ts > (last_update_time or ""):
+            latest_thermal_data = data
+            last_update_time = ts
+
+    # --- Occupancy: latest entry per sensor from daily jsonl files ---
+    best_occ: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, entry)
+    for p in DATA_DIR.glob("occupancy_*.jsonl"):
+        try:
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                sid = entry.get("sensor_id")
+                ts = entry.get("timestamp", "")
+                if not sid:
+                    continue
+                if sid not in best_occ or ts > best_occ[sid][0]:
+                    best_occ[sid] = (ts, entry)
+        except Exception:
+            continue
+
+    for sid, (ts, entry) in best_occ.items():
+        latest_occupancy_by_sensor[sid] = entry
+        if sid in latest_thermal_by_sensor and ts > (last_update_time_by_sensor.get(sid) or ""):
+            last_update_time_by_sensor[sid] = ts
+        if latest_occupancy is None or ts > (last_update_time or ""):
+            latest_occupancy = entry
+
+    if best_expanded or best_occ:
+        sensors = set(best_expanded) | set(best_occ)
+        print(f"Restored state from disk for {len(sensors)} sensor(s): {sorted(sensors)}")
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -664,7 +729,7 @@ def list_sensors() -> dict:
 def get_thermal_history(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
     date: Optional[str] = Query(default=None, description="YYYYMMDD (optional)"),
-    limit: int = Query(default=10000, description="Max frames to return (1..10000)"),
+    limit: int = Query(default=1000, description="Max frames to return (1..1000)"),
     offset: int = Query(default=0, description="Number of matching frames to skip"),
     include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
 ) -> dict:
@@ -848,6 +913,7 @@ def get_thermal_data(
             out["occupancy_effective_raw"] = occ.get("occupancy_effective_raw", occ.get("occupancy"))
             out["frame_valid"] = occ.get("frame_valid", True)
             out["room_temperature"] = occ.get("room_temperature")
+            out["people_clusters"] = convert_numpy_types(occ.get("people_clusters", []))
             out["fever_count"] = occ.get("fever_count", 0)
             out["elevated_count"] = occ.get("elevated_count", 0)
             out["any_fever"] = occ.get("any_fever", False)
@@ -868,6 +934,7 @@ def get_thermal_data(
         )
         out["frame_valid"] = latest_occupancy.get("frame_valid", True)
         out["room_temperature"] = latest_occupancy.get("room_temperature")
+        out["people_clusters"] = convert_numpy_types(latest_occupancy.get("people_clusters", []))
         out["fever_count"] = latest_occupancy.get("fever_count", 0)
         out["elevated_count"] = latest_occupancy.get("elevated_count", 0)
         out["any_fever"] = latest_occupancy.get("any_fever", False)
@@ -920,10 +987,14 @@ def get_occupancy_history(
     entries = []
     with open(path) as f:
         for line in f:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 entry = json.loads(line)
-                if sensor_id is None or entry.get("sensor_id") == sensor_id:
-                    entries.append(entry)
+            except Exception:
+                continue
+            if sensor_id is None or entry.get("sensor_id") == sensor_id:
+                entries.append(entry)
     return {"date": date_str, "sensor_id": sensor_id, "count": len(entries), "data": entries}
 
 
@@ -940,10 +1011,14 @@ def get_occupancy_stats(
     values = []
     with open(path) as f:
         for line in f:
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 entry = json.loads(line)
-                if sensor_id is None or entry.get("sensor_id") == sensor_id:
-                    values.append(entry["occupancy"])
+            except Exception:
+                continue
+            if sensor_id is None or entry.get("sensor_id") == sensor_id:
+                values.append(entry["occupancy"])
     if not values:
         raise HTTPException(status_code=404, detail="No occupancy data available")
     return {

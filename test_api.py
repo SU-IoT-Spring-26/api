@@ -71,8 +71,8 @@ def main() -> None:
     print()
 
     # 3. GET latest thermal
-    print("3. GET /api/thermal")
-    r = get("/api/thermal")
+    print("3. GET /api/thermal/current/poll?sensor_id=test-script")
+    r = get("/api/thermal/current/poll?sensor_id=test-script")
     r.raise_for_status()
     body = r.json()
     pixels = body.get("pixels") or []
