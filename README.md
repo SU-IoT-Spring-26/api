@@ -132,7 +132,9 @@ After this, every push to `main` (or a manual **Run workflow** from the Actions 
 Set in App Service **Configuration** → **Application settings**, or as `-e` when running Docker locally:
 
 - `THERMAL_DATA_DIR` – directory for thermal and occupancy files (default: `thermal_data`; in the image: `/app/thermal_data`)
-- `SAVE_THERMAL_DATA` – set to `false` to disable saving (default: `true`)
+- `SAVE_TO_BLOB` – write thermal/occupancy data to Azure Blob (default: `true` when `AZURE_STORAGE_CONNECTION_STRING` is set, else `false`)
+- `SAVE_LOCAL_DATA` – write thermal/occupancy data to local disk under `THERMAL_DATA_DIR` (default: `false` when Blob is enabled, else `true`)
+- `SAVE_THERMAL_DATA` – legacy alias for local writes (only used when `SAVE_LOCAL_DATA` is not set)
 - `PORT` – port to bind (Azure sets this automatically; default 8000 in the image)
 - `AZURE_STORAGE_CONNECTION_STRING` – if set, thermal and occupancy data are also written to Azure Blob Storage
 - `AZURE_STORAGE_CONTAINER_NAME` – blob container name (default: `iotoccupancydata`)
@@ -177,9 +179,9 @@ Compact format from ESP32:
 
 - `sensor_id` (optional), `w`, `h`, `min`, `max`, `t` (list of temperatures, row-major)
 
-**Local storage:** thermal frames under `THERMAL_DATA_DIR` as `thermal_<sensor_id>_<timestamp>_compact.json` and `_expanded.json`; occupancy as `occupancy_YYYYMMDD.jsonl` with one JSON object per line.
+**Local storage:** thermal frames under `THERMAL_DATA_DIR` as compressed compact files `thermal_<sensor_id>_<timestamp>_compact.json.gz`; occupancy as `occupancy_YYYYMMDD.jsonl` with one JSON object per line.
 
-**Azure Blob Storage** (when `AZURE_STORAGE_CONNECTION_STRING` is set): same data is also written to the configured container. Thermal files go under the `thermal/` prefix (e.g. `thermal/thermal_sensor1_20250107_120000_compact.json`). Occupancy is appended to `occupancy/occupancy_YYYYMMDD.jsonl` (append blobs). Local storage is always used when `SAVE_THERMAL_DATA` is true; Blob is an additional copy.
+**Azure Blob Storage** (when `AZURE_STORAGE_CONNECTION_STRING` is set): thermal compact payloads are stored compressed under the `thermal/` prefix (e.g. `thermal/thermal_sensor1_20250107_120000_compact.json.gz`). Occupancy is appended to `occupancy/occupancy_YYYYMMDD.jsonl` (append blobs). By default, Blob is used as the durable store when configured.
 
 ## Multi-sensor support
 
@@ -203,13 +205,35 @@ The API tracks data from **all sensors** and makes it available via the endpoint
 - `date=YYYYMMDD` (optional) – Filter to frames from a specific date
 - `limit` (default: 100, max: 500) – Maximum number of frames to return
 - `offset` (default: 0) – Number of matching frames to skip (for paging)
-- `include_data` (default: false) – If `true`, include full frame payload; if `false`, return metadata only (timestamp, sensor_id, format, filename)
+- `include_data` (default: false) – If `true`, include full frame payload; compact stored frames are expanded on access so consumers receive expanded frame data
 
 **Examples:**
 - All sensors, newest 100 (metadata only): `GET /api/thermal/history`
 - One sensor with full frames: `GET /api/thermal/history?sensor_id=living-room&include_data=true`
 - All sensors for a specific day: `GET /api/thermal/history?date=20260207&limit=500`
 - Page through results: `GET /api/thermal/history?limit=50&offset=0`, then `?limit=50&offset=50`, etc.
+
+Pagination response fields:
+- `has_more` – `true` when another page likely exists
+- `next_offset` – offset to request the next page (or `null` when done)
+
+Example page loop:
+
+```bash
+# First page
+curl "https://<occupancy-api>.azurewebsites.net/api/thermal/history?limit=100&offset=0"
+
+# Example response fields:
+# {
+#   "count": 100,
+#   "has_more": true,
+#   "next_offset": 100,
+#   "data": [ ... ]
+# }
+
+# Next page (use next_offset from previous response)
+curl "https://<occupancy-api>.azurewebsites.net/api/thermal/history?limit=100&offset=100"
+```
 
 **Note:** The history endpoint reads from locally stored files under `THERMAL_DATA_DIR`. Each frame includes `timestamp` (server receive time) and `sensor_id` alongside the thermal data.
 
