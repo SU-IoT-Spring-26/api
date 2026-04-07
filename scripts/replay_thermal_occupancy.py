@@ -98,9 +98,17 @@ def replay_compact_frames(
     old_save_local = getattr(m, "SAVE_LOCAL_DATA", getattr(m, "SAVE_DATA", True))
     old_save_data = getattr(m, "SAVE_DATA", old_save_local)
     old_save_bg = m._save_thermal_background
-    m.SAVE_LOCAL_DATA = False
-    m.SAVE_DATA = False
-    if not persist_background:
+    # Thermal/occupancy writes stay off; background .npy needs local persistence enabled.
+    if persist_background:
+        m.SAVE_LOCAL_DATA = True
+        m.SAVE_DATA = True
+        try:
+            m.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    else:
+        m.SAVE_LOCAL_DATA = False
+        m.SAVE_DATA = False
         m._save_thermal_background = lambda _sid: None  # type: ignore[assignment]
 
     if fresh:

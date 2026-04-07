@@ -1,4 +1,5 @@
 """Integration tests for every FastAPI endpoint in main.py."""
+import gzip
 import json
 from datetime import datetime
 from pathlib import Path
@@ -233,6 +234,81 @@ class TestThermalHistory:
         assert body["has_more"] is False
         assert body["next_offset"] is None
 
+    def _write_compact_gz(self, data_dir: Path, fname: str, ts_iso: str, sensor_id: str, compact: dict) -> None:
+        payload = {
+            "timestamp": ts_iso,
+            "format": "compact",
+            "sensor_id": sensor_id,
+            "data": compact,
+        }
+        raw = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        (data_dir / fname).write_bytes(raw)
+
+    def test_has_more_false_when_page_fills_exact_total(self, client, tmp_path):
+        """Two frames total, limit 2: no spurious next page."""
+        c1 = _make_compact(w=2, h=2, sensor_id="s1")
+        self._write_compact_gz(
+            tmp_path,
+            "thermal_s1_20260403_120000_000_compact.json.gz",
+            "2026-04-03T12:00:00",
+            "s1",
+            c1,
+        )
+        c2 = _make_compact(w=2, h=2, base_temp=22.0, sensor_id="s1")
+        self._write_compact_gz(
+            tmp_path,
+            "thermal_s1_20260403_110000_000_compact.json.gz",
+            "2026-04-03T11:00:00",
+            "s1",
+            c2,
+        )
+        body = client.get("/api/thermal/history?limit=2").json()
+        assert body["count"] == 2
+        assert body["has_more"] is False
+        assert body["next_offset"] is None
+
+    def test_has_more_true_and_next_offset(self, client, tmp_path):
+        """Three frames, limit 2: second page exists."""
+        for suf, ts, base in [
+            ("130000", "2026-04-03T13:00:00", 21.0),
+            ("120000", "2026-04-03T12:00:00", 22.0),
+            ("110000", "2026-04-03T11:00:00", 23.0),
+        ]:
+            c = _make_compact(w=2, h=2, base_temp=base, sensor_id="s1")
+            self._write_compact_gz(
+                tmp_path,
+                f"thermal_s1_20260403_{suf}_000_compact.json.gz",
+                ts,
+                "s1",
+                c,
+            )
+        p1 = client.get("/api/thermal/history?limit=2&offset=0").json()
+        assert p1["count"] == 2
+        assert p1["has_more"] is True
+        assert p1["next_offset"] == 2
+        p2 = client.get("/api/thermal/history?limit=2&offset=2").json()
+        assert p2["count"] == 1
+        assert p2["has_more"] is False
+        assert p2["next_offset"] is None
+
+    def test_include_data_expands_compact_and_sets_formats(self, client, tmp_path):
+        c = _make_compact(w=2, h=2, sensor_id="s1")
+        self._write_compact_gz(
+            tmp_path,
+            "thermal_s1_20260403_120000_000_compact.json.gz",
+            "2026-04-03T12:00:00",
+            "s1",
+            c,
+        )
+        body = client.get("/api/thermal/history?include_data=true&limit=1").json()
+        row = body["data"][0]
+        assert row["source_format"] == "compact"
+        assert row["returned_format"] == "expanded"
+        assert row["format"] == "expanded"
+        assert row["data"]["width"] == 2
+        assert row["data"]["height"] == 2
+        assert len(row["data"]["pixels"]) == 4
+
 
 # ---------------------------------------------------------------------------
 # GET /api/occupancy/history
@@ -449,6 +525,22 @@ class TestRestoreStateFromDisk:
         main._restore_state_from_disk()
         assert "cam-1" in main.latest_occupancy_by_sensor
         assert main.latest_occupancy_by_sensor["cam-1"]["occupancy"] == 3
+
+    def test_loads_compact_gzip_file(self, tmp_path):
+        main.DATA_DIR = tmp_path
+        compact = _make_compact(w=2, h=2, sensor_id="gz-s")
+        payload = {
+            "timestamp": "2026-04-03T12:00:00",
+            "format": "compact",
+            "sensor_id": "gz-s",
+            "data": compact,
+        }
+        raw = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        (tmp_path / "thermal_gzs_20260403_120000_000_compact.json.gz").write_bytes(raw)
+        main._restore_state_from_disk()
+        assert "gz-s" in main.latest_thermal_by_sensor
+        assert main.latest_thermal_by_sensor["gz-s"]["width"] == 2
+        assert len(main.latest_thermal_by_sensor["gz-s"]["pixels"]) == 4
 
     def test_picks_most_recent_expanded_file(self, tmp_path):
         main.DATA_DIR = tmp_path

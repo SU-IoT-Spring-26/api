@@ -776,6 +776,8 @@ def get_thermal_history(
     """
     limit_i = _safe_int(limit, 100, 1, 500)
     offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
+    # Fetch one extra row so has_more is false when the page is full but no next page exists.
+    fetch_limit = limit_i + 1
 
     matches: List[dict] = []
     seen = 0
@@ -812,33 +814,39 @@ def get_thermal_history(
         }
         if include_data:
             payload_data = payload.get("data")
+            source_format = fmt
+            returned_format = fmt
             if payload.get("format") == "compact" and isinstance(payload_data, dict) and "t" in payload_data:
                 try:
                     expanded = expand_thermal_data(payload_data)
                     expanded["sensor_id"] = sid
                     entry["data"] = expanded
-                    entry["source_format"] = "compact"
-                    entry["returned_format"] = "expanded"
+                    returned_format = "expanded"
                 except Exception:
                     entry["data"] = payload_data
+                    returned_format = "compact"
             else:
                 entry["data"] = payload_data
+            entry["source_format"] = source_format
+            entry["returned_format"] = returned_format
+            entry["format"] = returned_format
         matches.append(entry)
-        if len(matches) >= limit_i:
+        if len(matches) >= fetch_limit:
             break
 
-    has_more = len(matches) == limit_i
-    next_offset = (offset_i + len(matches)) if has_more else None
+    has_more = len(matches) > limit_i
+    page = matches[:limit_i]
+    next_offset = (offset_i + len(page)) if has_more else None
 
     return {
         "sensor_id": sensor_id,
         "date": date,
         "limit": limit_i,
         "offset": offset_i,
-        "count": len(matches),
+        "count": len(page),
         "has_more": has_more,
         "next_offset": next_offset,
-        "data": matches,
+        "data": page,
     }
 
 

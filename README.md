@@ -205,7 +205,7 @@ The API tracks data from **all sensors** and makes it available via the endpoint
 - `date=YYYYMMDD` (optional) – Filter to frames from a specific date
 - `limit` (default: 100, max: 500) – Maximum number of frames to return
 - `offset` (default: 0) – Number of matching frames to skip (for paging)
-- `include_data` (default: false) – If `true`, include full frame payload; compact stored frames are expanded on access so consumers receive expanded frame data
+- `include_data` (default: false) – If `true`, include full frame payload; compact stored frames are expanded on access. Each item then includes `source_format` (stored) and `returned_format` (payload shape); top-level `format` matches `returned_format`.
 
 **Examples:**
 - All sensors, newest 100 (metadata only): `GET /api/thermal/history`
@@ -214,7 +214,7 @@ The API tracks data from **all sensors** and makes it available via the endpoint
 - Page through results: `GET /api/thermal/history?limit=50&offset=0`, then `?limit=50&offset=50`, etc.
 
 Pagination response fields:
-- `has_more` – `true` when another page likely exists
+- `has_more` – `true` only when at least one more matching frame exists after this page
 - `next_offset` – offset to request the next page (or `null` when done)
 
 Example page loop:
