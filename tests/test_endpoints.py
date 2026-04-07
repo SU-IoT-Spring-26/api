@@ -221,10 +221,17 @@ class TestThermalHistory:
         body = client.get("/api/thermal/history").json()
         assert body["count"] == 0
 
-    def test_limit_capped_at_1000(self, client):
+    def test_limit_capped_at_500(self, client):
         body = client.get("/api/thermal/history?limit=9999").json()
-        # _safe_int clamps at 1000
-        assert body["limit"] == 1000
+        # _safe_int clamps at 500
+        assert body["limit"] == 500
+
+    def test_pagination_fields_present(self, client):
+        body = client.get("/api/thermal/history").json()
+        assert "has_more" in body
+        assert "next_offset" in body
+        assert body["has_more"] is False
+        assert body["next_offset"] is None
 
 
 # ---------------------------------------------------------------------------

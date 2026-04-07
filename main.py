@@ -183,6 +183,8 @@ else:
 # Backward-compatible alias for local writes.
 if "SAVE_THERMAL_DATA" in os.environ and _save_local_data_raw is None:
     SAVE_LOCAL_DATA = os.environ.get("SAVE_THERMAL_DATA", "true").lower() in ("1", "true", "yes")
+# Backward-compatible alias expected by offline tooling.
+SAVE_DATA = SAVE_LOCAL_DATA
 SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
 SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
 
@@ -241,6 +243,8 @@ def _load_thermal_background(sensor_id: str) -> None:
 
 def _save_thermal_background(sensor_id: str) -> None:
     """Persist thermal background for a sensor to disk."""
+    if not SAVE_LOCAL_DATA:
+        return
     arr = thermal_background_by_sensor.get(sensor_id)
     if arr is None:
         return

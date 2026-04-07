@@ -271,7 +271,7 @@ With labeled data you can score stored logs or replay thermal archives:
 
 - **`scripts/compare_occupancy_accuracy.py`** – CSV `timestamp,sensor_id,actual_count` vs `occupancy_*.jsonl`. Options `--field` and `--compare-fields` let you compare smoothed `occupancy`, `occupancy_effective_raw`, or `occupancy_raw_instant`.
 - **`scripts/compare_fever_accuracy.py`** – CSV `timestamp,sensor_id,fever` (0/1) vs fever flags in JSONL (`any_fever`, `any_fever_raw`, or `fever_count_positive`).
-- **`scripts/replay_thermal_occupancy.py`** – Re-run `thermal_*_compact.json` through the pipeline offline (no writes by default); optional CSV export.
+- **`scripts/replay_thermal_occupancy.py`** – Re-run `thermal_*_compact.json(.gz)` through the pipeline offline (no writes by default); optional CSV export.
 - **`scripts/calibrate_occupancy_thresholds.py`** – Small grid over `ROOM_TEMP_THRESHOLD` / `MIN_CLUSTER_SIZE` using replay + the same alignment as the accuracy script.
 
 Details and examples: [scripts/README.md](scripts/README.md).
