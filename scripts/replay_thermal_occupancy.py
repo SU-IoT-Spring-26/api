@@ -2,7 +2,8 @@
 """
 Replay stored compact thermal frames through the occupancy pipeline offline.
 
-Reads ``thermal_*_compact.json`` files (same shape as written by the API) in
+Reads ``thermal_*_compact.json`` and ``thermal_*_compact.json.gz`` files
+(same shape as written by the API) in
 chronological order and runs ``estimate_occupancy`` plus optional signal
 processing and background updates, without writing thermal/occupancy files.
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -49,6 +51,7 @@ def reset_pipeline_state(m: Any) -> None:
 
 def list_compact_paths(data_dir: Path, sensor_id: Optional[str]) -> List[Path]:
     paths = [p for p in data_dir.glob("thermal_*_compact.json") if p.is_file()]
+    paths.extend([p for p in data_dir.glob("thermal_*_compact.json.gz") if p.is_file()])
     if sensor_id is not None:
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sensor_id))[:64]
         paths = [p for p in paths if f"thermal_{safe}_" in p.name]
@@ -57,11 +60,18 @@ def list_compact_paths(data_dir: Path, sensor_id: Optional[str]) -> List[Path]:
 
 def load_payload_timestamp(path: Path) -> str:
     try:
-        with open(path, encoding="utf-8") as f:
-            payload = json.load(f)
+        payload = load_json_payload(path)
         return str(payload.get("timestamp") or "")
     except Exception:
         return ""
+
+
+def load_json_payload(path: Path) -> Dict[str, Any]:
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def replay_compact_frames(
@@ -85,10 +95,20 @@ def replay_compact_frames(
     data_dir = data_dir.resolve()
     m.DATA_DIR = data_dir
 
-    old_save = m.SAVE_DATA
+    old_save_local = getattr(m, "SAVE_LOCAL_DATA", getattr(m, "SAVE_DATA", True))
+    old_save_data = getattr(m, "SAVE_DATA", old_save_local)
     old_save_bg = m._save_thermal_background
-    m.SAVE_DATA = False
-    if not persist_background:
+    # Thermal/occupancy writes stay off; background .npy needs local persistence enabled.
+    if persist_background:
+        m.SAVE_LOCAL_DATA = True
+        m.SAVE_DATA = True
+        try:
+            m.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    else:
+        m.SAVE_LOCAL_DATA = False
+        m.SAVE_DATA = False
         m._save_thermal_background = lambda _sid: None  # type: ignore[assignment]
 
     if fresh:
@@ -104,8 +124,7 @@ def replay_compact_frames(
     try:
         for path in paths:
             try:
-                with open(path, encoding="utf-8") as f:
-                    payload = json.load(f)
+                payload = load_json_payload(path)
             except json.JSONDecodeError:
                 continue
             if payload.get("format") != "compact":
@@ -156,19 +175,22 @@ def replay_compact_frames(
             }
             rows_out.append(row)
     finally:
-        m.SAVE_DATA = old_save
+        m.SAVE_LOCAL_DATA = old_save_local
+        m.SAVE_DATA = old_save_data
         m._save_thermal_background = old_save_bg
 
     return rows_out
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay compact thermal JSON files through the occupancy pipeline.")
+    parser = argparse.ArgumentParser(
+        description="Replay compact thermal JSON(.gz) files through the occupancy pipeline."
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=None,
-        help="Directory with thermal_*_compact.json (default: THERMAL_DATA_DIR or ./thermal_data)",
+        help="Directory with thermal_*_compact.json(.gz) (default: THERMAL_DATA_DIR or ./thermal_data)",
     )
     parser.add_argument("--sensor-id", default=None, help="Only replay files for this sensor_id")
     parser.add_argument(

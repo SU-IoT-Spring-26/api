@@ -78,7 +78,7 @@ Prints aligned row count, accuracy, and balanced accuracy (mean of sensitivity a
 
 ## replay_thermal_occupancy.py
 
-Replays `thermal_*_compact.json` frames through `estimate_occupancy` and (by default) `apply_occupancy_signal_processing` + background updates. Does **not** write thermal or occupancy files unless you pass `--persist-background` (background `.npy` only). Uses **`main.DATA_DIR`** = `--data-dir` so `background_*.npy` loads match that folder.
+Replays `thermal_*_compact.json` and `thermal_*_compact.json.gz` frames through `estimate_occupancy` and (by default) `apply_occupancy_signal_processing` + background updates. Does **not** write thermal or occupancy files unless you pass `--persist-background` (background `.npy` only). Uses **`main.DATA_DIR`** = `--data-dir` so `background_*.npy` loads match that folder.
 
 ```bash
 python scripts/replay_thermal_occupancy.py --data-dir ./thermal_data

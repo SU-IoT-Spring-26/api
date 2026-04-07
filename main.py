@@ -7,6 +7,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 
 import json
 import os
+import gzip
 from collections import Counter, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -98,25 +99,27 @@ def _restore_state_from_disk() -> None:
     if not DATA_DIR.exists():
         return
 
-    # --- Thermal frames: latest expanded file per sensor ---
-    # Files are named thermal_<safe_id>_<timestamp>_expanded.json; lexicographic sort == time order.
-    expanded_files = sorted(DATA_DIR.glob("thermal_*_expanded.json"), key=lambda p: p.name, reverse=True)
-    best_expanded: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, data)
-    for p in expanded_files:
+    # --- Thermal frames: latest frame per sensor from stored compact/expanded files ---
+    best_thermal: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, data)
+    for p in _iter_thermal_files():
         try:
-            payload = json.loads(p.read_text())
+            payload = _read_json_payload(p)
             sid = payload.get("sensor_id") or (payload.get("data") or {}).get("sensor_id")
-            if not sid or sid in best_expanded:
+            if not sid or sid in best_thermal:
                 continue
             ts = payload.get("timestamp", "")
-            best_expanded[sid] = (ts, payload)
+            data = payload.get("data") or {}
+            if payload.get("format") == "compact" and "t" in data:
+                expanded = expand_thermal_data(data)
+                expanded["sensor_id"] = sid
+                data = expanded
+            if not data.get("pixels"):
+                continue
+            best_thermal[sid] = (ts, data)
         except Exception:
             continue
 
-    for sid, (ts, payload) in best_expanded.items():
-        data = payload.get("data") or {}
-        if not data.get("pixels"):
-            continue
+    for sid, (ts, data) in best_thermal.items():
         latest_thermal_by_sensor[sid] = data
         last_update_time_by_sensor[sid] = ts
         if latest_thermal_data is None or ts > (last_update_time or ""):
@@ -148,8 +151,8 @@ def _restore_state_from_disk() -> None:
         if latest_occupancy is None or ts > (last_update_time or ""):
             latest_occupancy = entry
 
-    if best_expanded or best_occ:
-        sensors = set(best_expanded) | set(best_occ)
+    if best_thermal or best_occ:
+        sensors = set(best_thermal) | set(best_occ)
         print(f"Restored state from disk for {len(sensors)} sensor(s): {sorted(sensors)}")
 
 
@@ -163,7 +166,25 @@ app.add_middleware(
 
 # Configuration
 DATA_DIR = Path(os.environ.get("THERMAL_DATA_DIR", "thermal_data"))
-SAVE_DATA = os.environ.get("SAVE_THERMAL_DATA", "true").lower() in ("1", "true", "yes")
+_blob_conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+_save_to_blob_raw = os.environ.get("SAVE_TO_BLOB")
+if _save_to_blob_raw is None:
+    SAVE_TO_BLOB = bool(_blob_conn_str)
+else:
+    SAVE_TO_BLOB = _save_to_blob_raw.lower() in ("1", "true", "yes")
+
+_save_local_data_raw = os.environ.get("SAVE_LOCAL_DATA")
+if _save_local_data_raw is None:
+    # Default to Blob persistence when Blob is configured.
+    SAVE_LOCAL_DATA = not SAVE_TO_BLOB
+else:
+    SAVE_LOCAL_DATA = _save_local_data_raw.lower() in ("1", "true", "yes")
+
+# Backward-compatible alias for local writes.
+if "SAVE_THERMAL_DATA" in os.environ and _save_local_data_raw is None:
+    SAVE_LOCAL_DATA = os.environ.get("SAVE_THERMAL_DATA", "true").lower() in ("1", "true", "yes")
+# Backward-compatible alias expected by offline tooling.
+SAVE_DATA = SAVE_LOCAL_DATA
 SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
 SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
 
@@ -205,7 +226,7 @@ last_update_time_by_sensor: Dict[str, str] = {}
 latest_occupancy_by_sensor: Dict[str, dict] = {}
 _data_counter = 0
 
-if SAVE_DATA:
+if SAVE_LOCAL_DATA:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -222,6 +243,8 @@ def _load_thermal_background(sensor_id: str) -> None:
 
 def _save_thermal_background(sensor_id: str) -> None:
     """Persist thermal background for a sensor to disk."""
+    if not SAVE_LOCAL_DATA:
+        return
     arr = thermal_background_by_sensor.get(sensor_id)
     if arr is None:
         return
@@ -527,6 +550,14 @@ def convert_numpy_types(obj: Any) -> Any:
         return tuple(convert_numpy_types(x) for x in obj)
     return obj
 
+
+def _read_json_payload(path: Path) -> dict:
+    """Read JSON payload from .json or .json.gz files."""
+    if path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(path.read_text())
+
 def _get_sql_connection():
     """Return a cached Azure SQL connection. Returns None if not configured or permanently disabled."""
     global _sql_connection
@@ -624,40 +655,36 @@ def save_occupancy_data_sql(occupancy_result: dict, timestamp_iso: Optional[str]
                 pass
 
 
-def save_thermal_data(
-    compact_data: dict, expanded_data: dict, sensor_id: Optional[str] = None
-) -> None:
+def save_thermal_data(compact_data: dict, sensor_id: Optional[str] = None) -> None:
     global _data_counter
-    if not SAVE_DATA:
+    if not SAVE_LOCAL_DATA and not SAVE_TO_BLOB:
         return
     sid = sensor_id or compact_data.get("sensor_id") or "unknown"
     safe_id = _sanitize_sensor_id_for_filename(sid)
     try:
         timestamp = datetime.now()
         ts = timestamp.strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        for fmt, data, suffix in [
-            ("compact", compact_data, "compact"),
-            ("expanded", expanded_data, "expanded"),
-        ]:
-            payload = {
-                "timestamp": timestamp.isoformat(),
-                "format": fmt,
-                "sensor_id": sid,
-                "data": data,
-            }
-            path = DATA_DIR / f"thermal_{safe_id}_{ts}_{suffix}.json"
-            json_bytes = json.dumps(payload, indent=2).encode("utf-8")
+        payload = {
+            "timestamp": timestamp.isoformat(),
+            "format": "compact",
+            "sensor_id": sid,
+            "data": compact_data,
+        }
+        compressed_bytes = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        path = DATA_DIR / f"thermal_{safe_id}_{ts}_compact.json.gz"
+        if SAVE_LOCAL_DATA:
             with open(path, "wb") as f:
-                f.write(json_bytes)
-            # Azure Blob: same content under thermal/ prefix
-            _upload_blob(f"thermal/{path.name}", json_bytes)
+                f.write(compressed_bytes)
+        if SAVE_TO_BLOB:
+            # Azure Blob: compressed compact payload for long-term retention.
+            _upload_blob(f"thermal/{path.name}", compressed_bytes, content_type="application/gzip")
         _data_counter += 1
     except Exception as e:
         print(f"Error saving thermal data: {e}")
 
 
 def save_occupancy_data(occupancy_result: dict) -> None:
-    if not SAVE_DATA:
+    if not SAVE_LOCAL_DATA and not SAVE_TO_BLOB:
         return
     try:
         timestamp = datetime.now()
@@ -687,19 +714,22 @@ def save_occupancy_data(occupancy_result: dict) -> None:
             "frame_valid": bool(occupancy_result.get("frame_valid", True)),
         }
         line = json.dumps(entry) + "\n"
-        with open(path, "a") as f:
-            f.write(line)
-        # Azure Blob: append to daily append blob
-        _append_to_blob(f"occupancy/occupancy_{date_str}.jsonl", line)
+        if SAVE_LOCAL_DATA:
+            with open(path, "a") as f:
+                f.write(line)
+        if SAVE_TO_BLOB:
+            # Azure Blob: append to daily append blob
+            _append_to_blob(f"occupancy/occupancy_{date_str}.jsonl", line)
     except Exception as e:
         print(f"Error saving occupancy data: {e}")
 
 
 def _iter_thermal_files() -> List[Path]:
-    """Return all locally stored thermal frame files (compact + expanded)."""
+    """Return all locally stored thermal frame files (legacy json + compressed json.gz)."""
     if not DATA_DIR.exists():
         return []
     files = [p for p in DATA_DIR.glob("thermal_*.json") if p.is_file()]
+    files.extend([p for p in DATA_DIR.glob("thermal_*.json.gz") if p.is_file()])
     # Newest first (filenames include timestamp)
     files.sort(key=lambda p: p.name, reverse=True)
     return files
@@ -719,10 +749,10 @@ def list_sensors() -> dict:
     sensors = set(latest_thermal_by_sensor.keys()) | set(latest_occupancy_by_sensor.keys())
     # Add sensors found on disk
     for p in _iter_thermal_files():
-        # Filename: thermal_<safe_id>_<ts>_<suffix>.json ; safe_id may differ from original.
+        # Filename: thermal_<safe_id>_<ts>_<suffix>.json(.gz) ; safe_id may differ from original.
         # Prefer payload sensor_id for correctness.
         try:
-            payload = json.loads(p.read_text())
+            payload = _read_json_payload(p)
             sid = payload.get("sensor_id")
             if sid:
                 sensors.add(str(sid))
@@ -736,22 +766,25 @@ def list_sensors() -> dict:
 def get_thermal_history(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
     date: Optional[str] = Query(default=None, description="YYYYMMDD (optional)"),
-    limit: int = Query(default=1000, description="Max frames to return (1..1000)"),
+    limit: int = Query(default=100, description="Max frames to return (1..500)"),
     offset: int = Query(default=0, description="Number of matching frames to skip"),
     include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
 ) -> dict:
     """
     Return locally stored thermal frames (all sensors by default).
-    Uses the saved JSON files under THERMAL_DATA_DIR.
+    Uses the saved thermal frame files under THERMAL_DATA_DIR, including legacy
+    .json and compressed .json.gz files.
     """
-    limit_i = _safe_int(limit, 100, 1, 1000)
+    limit_i = _safe_int(limit, 100, 1, 500)
     offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
+    # Fetch one extra row so has_more is false when the page is full but no next page exists.
+    fetch_limit = limit_i + 1
 
     matches: List[dict] = []
     seen = 0
     for p in _iter_thermal_files():
         try:
-            payload = json.loads(p.read_text())
+            payload = _read_json_payload(p)
         except Exception:
             continue
 
@@ -781,18 +814,40 @@ def get_thermal_history(
             "format": fmt,
         }
         if include_data:
-            entry["data"] = payload.get("data")
+            payload_data = payload.get("data")
+            source_format = fmt
+            returned_format = fmt
+            if payload.get("format") == "compact" and isinstance(payload_data, dict) and "t" in payload_data:
+                try:
+                    expanded = expand_thermal_data(payload_data)
+                    expanded["sensor_id"] = sid
+                    entry["data"] = expanded
+                    returned_format = "expanded"
+                except Exception:
+                    entry["data"] = payload_data
+                    returned_format = "compact"
+            else:
+                entry["data"] = payload_data
+            entry["source_format"] = source_format
+            entry["returned_format"] = returned_format
+            entry["format"] = returned_format
         matches.append(entry)
-        if len(matches) >= limit_i:
+        if len(matches) >= fetch_limit:
             break
+
+    has_more = len(matches) > limit_i
+    page = matches[:limit_i]
+    next_offset = (offset_i + len(page)) if has_more else None
 
     return {
         "sensor_id": sensor_id,
         "date": date,
         "limit": limit_i,
         "offset": offset_i,
-        "count": len(matches),
-        "data": matches,
+        "count": len(page),
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "data": page,
     }
 
 
@@ -882,7 +937,7 @@ def receive_thermal_data(data: dict) -> dict:
     latest_thermal_by_sensor[sensor_id] = dict(latest_thermal_data) if latest_thermal_data else {}
     latest_occupancy_by_sensor[sensor_id] = dict(occupancy_result)
     last_update_time_by_sensor[sensor_id] = now_iso
-    save_thermal_data(compact_data, latest_thermal_data, sensor_id)
+    save_thermal_data(compact_data, sensor_id)
     save_occupancy_data(occupancy_result)
     save_occupancy_data_sql(occupancy_result, timestamp_iso=now_iso)
     pixel_count = len(latest_thermal_data.get("pixels", []))
@@ -1346,7 +1401,7 @@ async function poll() {
   } catch(e) {
     statusEl.textContent = `Fetch error: ${e.message}`;
   }
-  pollTimer = setTimeout(poll, 2000);
+  pollTimer = setTimeout(poll, 10000);
 }
 
 function restart() {
