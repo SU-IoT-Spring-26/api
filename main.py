@@ -772,7 +772,8 @@ def get_thermal_history(
 ) -> dict:
     """
     Return locally stored thermal frames (all sensors by default).
-    Uses the saved JSON files under THERMAL_DATA_DIR.
+    Uses the saved thermal frame files under THERMAL_DATA_DIR, including legacy
+    .json and compressed .json.gz files.
     """
     limit_i = _safe_int(limit, 100, 1, 500)
     offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
