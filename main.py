@@ -8,6 +8,7 @@ Stores data locally and optionally to Azure Blob Storage when configured.
 import json
 import os
 import gzip
+import threading
 from collections import Counter, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -18,7 +19,15 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from scipy.ndimage import label
+
+# Optional ML inference engine (gracefully absent if onnxruntime not installed)
+try:
+    from ml import MLInferenceEngine as _MLInferenceEngine
+    _ml_engine = _MLInferenceEngine()
+except Exception:
+    _ml_engine = None  # type: ignore[assignment]
 
 # Optional Azure Blob Storage (only used if AZURE_STORAGE_CONNECTION_STRING is set)
 # _blob_container_client: container client if connected, False if init failed, None if not tried
@@ -81,6 +90,8 @@ def _append_to_blob(blob_name: str, line: str) -> None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     _restore_state_from_disk()
+    if _ml_engine is not None:
+        _ml_engine.load(blob_container=_get_blob_container())
     yield
 
 
@@ -155,6 +166,8 @@ def _restore_state_from_disk() -> None:
         sensors = set(best_thermal) | set(best_occ)
         print(f"Restored state from disk for {len(sensors)} sensor(s): {sorted(sensors)}")
 
+    _load_ml_labels()  # called unconditionally — handles missing DATA_DIR gracefully
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -228,6 +241,67 @@ _data_counter = 0
 
 if SAVE_LOCAL_DATA:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ML labelling and training state
+_ml_labels: Dict[str, dict] = {}  # filename → {file, occupancy, fever, ts}
+_ml_training_status: dict = {"state": "idle", "message": "", "ts": None, "log": []}
+_ml_training_lock = threading.Lock()
+
+
+def _load_ml_labels() -> None:
+    """Load persisted ML frame labels from disk into _ml_labels.
+
+    Called unconditionally at startup — DATA_DIR may not exist in Blob-only
+    mode, in which case local load is simply skipped.
+    """
+    global _ml_labels
+    if not DATA_DIR.exists():
+        return
+    path = DATA_DIR / "ml_labels.jsonl"
+    if not path.exists():
+        return
+    loaded: Dict[str, dict] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entry = json.loads(line)
+                    if "file" in entry:
+                        loaded[entry["file"]] = entry
+        _ml_labels = loaded
+        print(f"Loaded {len(_ml_labels)} ML label(s)")
+    except Exception as e:
+        print(f"Could not load ML labels: {e}")
+
+
+def _persist_ml_labels() -> None:
+    """Rewrite ml_labels.jsonl from the in-memory dict and sync to Blob.
+
+    Local write and Blob upload are independent: Blob-only deployments
+    (SAVE_LOCAL_DATA=false) still persist labels to Azure Blob.
+    A consistent snapshot is taken under lock so concurrent label POSTs
+    cannot cause RuntimeError or partial writes.
+    """
+    with _ml_training_lock:
+        snapshot = list(_ml_labels.values())
+    if SAVE_LOCAL_DATA:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / "ml_labels.jsonl"
+        try:
+            with open(path, "w") as f:
+                for entry in snapshot:
+                    f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        except Exception as e:
+            print(f"Error saving ML labels locally: {e}")
+    if SAVE_TO_BLOB:
+        try:
+            content = "".join(
+                json.dumps(e, separators=(",", ":")) + "\n" for e in snapshot
+            )
+            _upload_blob("ml/labels.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
+        except Exception as e:
+            print(f"Error uploading ML labels to Blob: {e}")
 
 
 def _load_thermal_background(sensor_id: str) -> None:
@@ -928,6 +1002,13 @@ def receive_thermal_data(data: dict) -> dict:
         _maybe_update_thermal_background(
             sensor_id, temp_array_2d, int(occupancy_result.get("occupancy_effective_raw", 0))
         )
+        if _ml_engine is not None and _ml_engine.available:
+            ml_result = _ml_engine.predict(
+                temp_array_2d,
+                background=thermal_background_by_sensor.get(sensor_id),
+            )
+            if ml_result:
+                occupancy_result["ml"] = ml_result
     except Exception:
         pass
     latest_occupancy = occupancy_result
@@ -1240,6 +1321,284 @@ def get_occupancy_predict(
     }
 
 
+# ---------------------------------------------------------------------------
+# ML API endpoints
+# ---------------------------------------------------------------------------
+
+class _MLLabelRequest(BaseModel):
+    file: str
+    occupancy: int
+    fever: bool
+
+
+@app.get("/api/ml/status")
+def get_ml_status() -> dict:
+    """ML model status, label counts, and training progress."""
+    occ_loaded = bool(_ml_engine and _ml_engine.occupancy_model_loaded)
+    fever_loaded = bool(_ml_engine and _ml_engine.fever_model_loaded)
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
+        training_snap = dict(_ml_training_status)
+    occ_dist: Dict[str, int] = {}
+    for v in labels_snap:
+        k = str(v.get("occupancy", 0))
+        occ_dist[k] = occ_dist.get(k, 0) + 1
+    return {
+        "occupancy_model": occ_loaded,
+        "fever_model": fever_loaded,
+        "n_labels": len(labels_snap),
+        "fever_label_count": sum(1 for v in labels_snap if v.get("fever")),
+        "occupancy_distribution": occ_dist,
+        "training": training_snap,
+    }
+
+
+@app.get("/api/ml/labels")
+def get_ml_labels_api() -> dict:
+    """Return all stored frame labels."""
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
+    return {"labels": labels_snap, "count": len(labels_snap)}
+
+
+@app.post("/api/ml/label")
+def _is_valid_thermal_filename(filename: str) -> bool:
+    return filename.startswith("thermal_") and (
+        filename.endswith("_compact.json") or filename.endswith("_compact.json.gz")
+    )
+
+
+def post_ml_label(req: _MLLabelRequest) -> dict:
+    """Save or update a ground-truth label for a thermal frame file."""
+    safe_file = Path(req.file).name
+    if not safe_file:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not _is_valid_thermal_filename(safe_file):
+        raise HTTPException(status_code=400, detail="file must match thermal_*_compact.json(.gz)")
+    if not (DATA_DIR / safe_file).is_file():
+        raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
+    if not 0 <= req.occupancy <= 20:
+        raise HTTPException(status_code=400, detail="occupancy must be 0–20")
+    label_entry = {
+        "file": safe_file,
+        "occupancy": req.occupancy,
+        "fever": req.fever,
+        "ts": datetime.now().isoformat(),
+    }
+    with _ml_training_lock:
+        _ml_labels[safe_file] = label_entry
+    _persist_ml_labels()
+    return {"status": "ok", "label": label_entry}
+
+
+@app.get("/api/ml/infer")
+def get_ml_infer(file: str = Query(..., description="Thermal frame filename")) -> dict:
+    """Run heuristic and ML inference on a stored thermal frame and return both results."""
+    safe_file = Path(file).name
+    local_path = DATA_DIR / safe_file
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
+    try:
+        payload = _read_json_payload(local_path)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not parse frame: {e}")
+
+    compact = payload.get("data") or payload
+    sensor_id = payload.get("sensor_id")
+
+    try:
+        expanded = expand_thermal_data(compact)
+        expanded["sensor_id"] = sensor_id
+    except Exception:
+        expanded = None
+
+    try:
+        heuristic = convert_numpy_types(estimate_occupancy(compact, sensor_id=sensor_id))
+    except Exception as e:
+        heuristic = {"error": str(e)}
+
+    ml_result = None
+    if _ml_engine and _ml_engine.available:
+        try:
+            arr = thermal_data_to_array(compact)
+            bg = thermal_background_by_sensor.get(sensor_id) if sensor_id else None
+            ml_result = _ml_engine.predict(arr, bg)
+        except Exception as e:
+            ml_result = {"error": str(e)}
+
+    return {
+        "file": safe_file,
+        "sensor_id": sensor_id,
+        "timestamp": payload.get("timestamp"),
+        "frame": expanded,
+        "heuristic": heuristic,
+        "ml": ml_result,
+        "existing_label": _ml_labels.get(safe_file),
+    }
+
+
+@app.post("/api/ml/train")
+def post_ml_train() -> dict:
+    """Trigger a background model training run from all labelled frames."""
+    global _ml_training_status
+    with _ml_training_lock:
+        if _ml_training_status.get("state") in {"starting", "running"}:
+            return {"status": "already_running", "training": dict(_ml_training_status)}
+        label_count = len(_ml_labels)
+        if label_count < 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Need at least 10 labelled frames to train; have {label_count}.",
+            )
+        # Mark as starting inside the lock so a concurrent request sees it
+        # before the thread has a chance to update it itself.
+        _ml_training_status = {
+            "state": "starting",
+            "message": "Starting training thread…",
+            "ts": datetime.now().isoformat(),
+            "log": [],
+        }
+    t = threading.Thread(target=_run_training_thread, daemon=True)
+    t.start()
+    return {"status": "started"}
+
+
+def _run_training_thread() -> None:
+    """Background thread: build features → train → export ONNX → reload engine."""
+    global _ml_training_status
+    log_lines: List[str] = []
+
+    def log(msg: str) -> None:
+        log_lines.append(msg)
+        with _ml_training_lock:
+            _ml_training_status = {**_ml_training_status, "message": msg, "log": list(log_lines)}
+        print(f"[ML Train] {msg}")
+
+    with _ml_training_lock:
+        _ml_training_status = {"state": "running", "message": "Starting…", "ts": datetime.now().isoformat(), "log": []}
+
+    try:
+        from sklearn.ensemble import GradientBoostingClassifier  # noqa: PLC0415
+        from sklearn.model_selection import cross_val_score  # noqa: PLC0415
+    except ImportError:
+        with _ml_training_lock:
+            _ml_training_status = {
+                "state": "error",
+                "message": "scikit-learn not installed. Add it to requirements.txt and redeploy.",
+                "ts": datetime.now().isoformat(),
+                "log": log_lines,
+            }
+        return
+
+    try:
+        from ml.features import extract as _ml_extract  # noqa: PLC0415
+    except ImportError as e:
+        with _ml_training_lock:
+            _ml_training_status = {"state": "error", "message": f"ml package unavailable: {e}", "ts": datetime.now().isoformat(), "log": log_lines}
+        return
+
+    # Snapshot labels under lock so concurrent POST /api/ml/label can't mutate
+    # the dict during iteration or produce inconsistent training data.
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
+    log(f"Building features for {len(labels_snap)} labelled frames…")
+    features, occ_targets, fever_targets = [], [], []
+
+    for lbl in labels_snap:
+        try:
+            path = DATA_DIR / lbl["file"]
+            if not path.exists():
+                log(f"  Skipping missing file: {lbl['file']}")
+                continue
+            payload = _read_json_payload(path)
+            compact = payload.get("data") or payload
+            arr = thermal_data_to_array(compact)
+            bg = thermal_background_by_sensor.get(payload.get("sensor_id"))
+            features.append(_ml_extract(arr, bg))
+            occ_targets.append(int(lbl["occupancy"]))
+            fever_targets.append(1 if lbl.get("fever") else 0)
+        except Exception as exc:
+            log(f"  Warning: {lbl['file']}: {exc}")
+
+    n = len(features)
+    if n < 10:
+        with _ml_training_lock:
+            _ml_training_status = {
+                "state": "error",
+                "message": f"Only {n} usable feature vectors (need 10+). Check that labelled files still exist.",
+                "ts": datetime.now().isoformat(),
+                "log": log_lines,
+            }
+        return
+
+    X = np.array(features, dtype=np.float32)
+    y_occ = np.array(occ_targets)
+    y_fever = np.array(fever_targets)
+    out_dir = Path(os.environ.get("ML_MODEL_DIR", "ml_models"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"Training occupancy model on {n} samples (classes: {sorted(set(occ_targets))})…")
+    occ_clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
+    try:
+        cv = min(5, max(2, n // 5))
+        scores = cross_val_score(occ_clf, X, y_occ, cv=cv, scoring="accuracy")
+        log(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
+    except Exception as exc:
+        log(f"  CV skipped: {exc}")
+    occ_clf.fit(X, y_occ)
+    _export_onnx_model(occ_clf, X.shape[1], out_dir / "occupancy_model.onnx", "occupancy_model", log)
+
+    fever_pos = int(y_fever.sum())
+    if fever_pos >= 5:
+        log(f"Training fever model ({fever_pos}/{n} positive samples)…")
+        fever_clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+        try:
+            cv = min(5, max(2, n // 5))
+            scores = cross_val_score(fever_clf, X, y_fever, cv=cv, scoring="f1")
+            log(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
+        except Exception as exc:
+            log(f"  CV skipped: {exc}")
+        fever_clf.fit(X, y_fever)
+        _export_onnx_model(fever_clf, X.shape[1], out_dir / "fever_model.onnx", "fever_model", log)
+    else:
+        log(f"Skipping fever model — need ≥5 positive samples, have {fever_pos}")
+
+    log("Reloading ML engine with new models…")
+    if _ml_engine:
+        _ml_engine.load(blob_container=_get_blob_container())
+
+    with _ml_training_lock:
+        _ml_training_status = {
+            "state": "done",
+            "message": f"Trained on {n} samples.",
+            "ts": datetime.now().isoformat(),
+            "log": log_lines,
+        }
+
+
+def _export_onnx_model(clf, n_features: int, out_path: Path, name: str, log) -> None:
+    try:
+        from skl2onnx import convert_sklearn  # noqa: PLC0415
+        from skl2onnx.common.data_types import FloatTensorType  # noqa: PLC0415
+    except ImportError:
+        log(f"  skl2onnx not installed — skipping ONNX export for {name}")
+        return
+    try:
+        initial_type = [("float_input", FloatTensorType([None, n_features]))]
+        onnx_bytes = convert_sklearn(clf, name=name, initial_types=initial_type).SerializeToString()
+        out_path.write_bytes(onnx_bytes)
+        log(f"  Saved {out_path.name} ({out_path.stat().st_size // 1024} KB)")
+        if SAVE_TO_BLOB:
+            _upload_blob(f"ml/{out_path.name}", onnx_bytes, content_type="application/octet-stream")
+            log(f"  Uploaded to Azure Blob: ml/{out_path.name}")
+    except Exception as exc:
+        log(f"  ONNX export error for {name}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# HTML pages
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def visualization_page() -> str:
     """Live thermal visualization dashboard."""
@@ -1252,7 +1611,10 @@ def visualization_page() -> str:
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 24px; }
-  h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 16px; color: #f8fafc; }
+  .topnav { display:flex; align-items:center; gap:16px; margin-bottom:18px; }
+  .topnav a { font-size:0.8rem; color:#6366f1; text-decoration:none; border:1px solid #6366f1; border-radius:5px; padding:4px 10px; }
+  .topnav a:hover { background:#6366f1; color:#fff; }
+  h1 { font-size: 1.25rem; font-weight: 600; color: #f8fafc; }
   .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
   select { background: #1e2330; color: #e2e8f0; border: 1px solid #2d3748; border-radius: 6px; padding: 6px 10px; font-size: 0.875rem; }
   .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
@@ -1271,7 +1633,10 @@ def visualization_page() -> str:
 </style>
 </head>
 <body>
-<h1>Thermal Camera Dashboard</h1>
+<div class="topnav">
+  <h1>Thermal Camera Dashboard</h1>
+  <a href="/ml">ML Studio</a>
+</div>
 <div class="toolbar">
   <label for="sensorSel" style="font-size:0.875rem;color:#94a3b8">Sensor:</label>
   <select id="sensorSel"><option value="">— any —</option></select>
@@ -1415,6 +1780,427 @@ showClusters.addEventListener('change', restart);
 
 loadSensors();
 poll();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/ml", response_class=HTMLResponse)
+def ml_studio_page() -> str:
+    """ML Studio — label frames, train models, run inference."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ML Studio</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+.topbar { display:flex; align-items:center; gap:14px; padding:14px 20px; border-bottom:1px solid #1e2330; }
+.topbar h1 { font-size:1.1rem; font-weight:600; color:#f8fafc; flex:1; }
+.topbar a { font-size:0.8rem; color:#6366f1; text-decoration:none; border:1px solid #6366f1; border-radius:5px; padding:4px 10px; }
+.topbar a:hover { background:#6366f1; color:#fff; }
+.tabs { display:flex; gap:0; border-bottom:1px solid #1e2330; padding:0 20px; }
+.tab-btn { padding:10px 18px; font-size:0.875rem; color:#94a3b8; background:none; border:none; border-bottom:2px solid transparent; cursor:pointer; }
+.tab-btn.active { color:#6366f1; border-bottom-color:#6366f1; }
+.tab-btn:hover:not(.active) { color:#e2e8f0; }
+.tab-panel { display:none; padding:20px; }
+.tab-panel.active { display:flex; flex-direction:column; gap:16px; }
+/* Status cards */
+.cards { display:flex; gap:12px; flex-wrap:wrap; }
+.card { background:#1a1f2e; border:1px solid #2d3748; border-radius:8px; padding:14px 18px; min-width:160px; }
+.card-title { font-size:0.7rem; color:#64748b; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+.card-value { font-size:1.4rem; font-weight:700; }
+.good { color:#4ade80; }
+.warn { color:#facc15; }
+.bad  { color:#f87171; }
+.idle { color:#64748b; }
+/* Toolbar */
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+select, input[type=date] { background:#1e2330; color:#e2e8f0; border:1px solid #2d3748; border-radius:6px; padding:6px 10px; font-size:0.875rem; }
+button { border:none; border-radius:6px; padding:7px 14px; font-size:0.875rem; cursor:pointer; font-weight:500; }
+.btn-primary { background:#6366f1; color:#fff; }
+.btn-primary:hover { background:#4f46e5; }
+.btn-primary:disabled { background:#374151; color:#6b7280; cursor:not-allowed; }
+.btn-success { background:#16a34a; color:#fff; }
+.btn-success:hover { background:#15803d; }
+.btn-success:disabled { background:#374151; color:#6b7280; cursor:not-allowed; }
+.btn-danger { background:#dc2626; color:#fff; }
+.btn-danger:hover { background:#b91c1c; }
+/* Split layout */
+.split { display:flex; gap:16px; align-items:flex-start; }
+.frame-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(88px,1fr)); gap:8px; max-height:65vh; overflow-y:auto; min-width:200px; }
+.thumb-wrap { position:relative; cursor:pointer; border:2px solid transparent; border-radius:5px; overflow:hidden; }
+.thumb-wrap:hover { border-color:#6366f1; }
+.thumb-wrap.selected { border-color:#6366f1; }
+.thumb-wrap canvas { display:block; width:100%; height:auto; image-rendering:pixelated; }
+.label-dot { position:absolute; top:3px; right:3px; width:10px; height:10px; border-radius:50%; border:1px solid #0f1117; }
+.dot-labelled { background:#4ade80; }
+.dot-fever { background:#f87171; }
+.detail-panel { flex:1; min-width:260px; background:#1a1f2e; border:1px solid #2d3748; border-radius:8px; padding:16px; display:flex; flex-direction:column; gap:12px; }
+.detail-panel canvas { image-rendering:pixelated; border:1px solid #2d3748; border-radius:4px; max-width:100%; }
+.field-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.field-row label { font-size:0.8rem; color:#94a3b8; }
+input[type=number] { width:70px; background:#1e2330; color:#e2e8f0; border:1px solid #2d3748; border-radius:6px; padding:5px 8px; font-size:0.875rem; }
+input[type=checkbox] { width:16px; height:16px; accent-color:#f87171; cursor:pointer; }
+.result-table { width:100%; border-collapse:collapse; font-size:0.8rem; }
+.result-table th { text-align:left; color:#64748b; padding:4px 8px; border-bottom:1px solid #2d3748; }
+.result-table td { padding:5px 8px; border-bottom:1px solid #1e2330; }
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:600; }
+.badge-yes { background:#7f1d1d; color:#fca5a5; }
+.badge-no  { background:#1e293b; color:#94a3b8; }
+.badge-na  { background:#292524; color:#78716c; }
+/* Log */
+.log-box { background:#0a0c12; border:1px solid #1e2330; border-radius:6px; padding:10px; font-family:monospace; font-size:0.75rem; color:#94a3b8; max-height:220px; overflow-y:auto; white-space:pre-wrap; }
+.empty-msg { color:#475569; font-size:0.85rem; text-align:center; padding:24px; }
+.section-title { font-size:0.8rem; font-weight:600; color:#94a3b8; text-transform:uppercase; letter-spacing:.05em; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>ML Studio</h1>
+  <a href="/">Dashboard</a>
+</div>
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('status')">Status &amp; Train</button>
+  <button class="tab-btn" onclick="switchTab('label')">Label Data</button>
+  <button class="tab-btn" onclick="switchTab('infer')">Run Inference</button>
+</div>
+
+<!-- STATUS TAB -->
+<div id="tab-status" class="tab-panel active">
+  <div class="cards" id="statusCards">
+    <div class="card"><div class="card-title">Occupancy Model</div><div class="card-value idle" id="cardOcc">—</div></div>
+    <div class="card"><div class="card-title">Fever Model</div><div class="card-value idle" id="cardFever">—</div></div>
+    <div class="card"><div class="card-title">Labelled Frames</div><div class="card-value idle" id="cardLabels">—</div></div>
+    <div class="card"><div class="card-title">Fever Labels</div><div class="card-value idle" id="cardFeverLabels">—</div></div>
+  </div>
+  <div>
+    <div class="section-title" style="margin-bottom:8px">Occupancy Distribution in Labels</div>
+    <div id="occDist" style="font-size:0.8rem;color:#94a3b8">—</div>
+  </div>
+  <div class="toolbar">
+    <button class="btn-primary" id="trainBtn" onclick="startTraining()" disabled>Train Model</button>
+    <button class="btn-primary" onclick="refreshStatus()">Refresh Status</button>
+    <span id="trainMsg" style="font-size:0.8rem;color:#94a3b8"></span>
+  </div>
+  <div>
+    <div class="section-title" style="margin-bottom:6px">Training Log</div>
+    <div class="log-box" id="trainLog">No training run yet.</div>
+  </div>
+</div>
+
+<!-- LABEL TAB -->
+<div id="tab-label" class="tab-panel">
+  <div class="toolbar">
+    <label style="font-size:0.875rem;color:#94a3b8">Sensor:</label>
+    <select id="labelSensorSel"><option value="">— all —</option></select>
+    <label style="font-size:0.875rem;color:#94a3b8">Date:</label>
+    <input type="date" id="labelDateInput">
+    <button class="btn-primary" onclick="loadFrames('label')">Load Frames</button>
+    <span id="labelCount" style="font-size:0.8rem;color:#94a3b8"></span>
+  </div>
+  <div class="split">
+    <div>
+      <div class="frame-grid" id="labelGrid"><div class="empty-msg">Load frames to start labelling.</div></div>
+    </div>
+    <div class="detail-panel" id="labelDetail">
+      <div class="empty-msg">Select a frame from the grid.</div>
+    </div>
+  </div>
+</div>
+
+<!-- INFER TAB -->
+<div id="tab-infer" class="tab-panel">
+  <div class="toolbar">
+    <label style="font-size:0.875rem;color:#94a3b8">Sensor:</label>
+    <select id="inferSensorSel"><option value="">— all —</option></select>
+    <label style="font-size:0.875rem;color:#94a3b8">Date:</label>
+    <input type="date" id="inferDateInput">
+    <button class="btn-primary" onclick="loadFrames('infer')">Load Frames</button>
+  </div>
+  <div class="split">
+    <div>
+      <div class="frame-grid" id="inferGrid"><div class="empty-msg">Load frames to select one for inference.</div></div>
+    </div>
+    <div class="detail-panel" id="inferDetail">
+      <div class="empty-msg">Select a frame from the grid.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+let labelFrames = [], inferFrames = [];
+let labelSelected = null, inferSelected = null;
+let labelMap = {};   // file → {occupancy, fever}
+let statusPoll = null;
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach((b, i) => {
+    b.classList.toggle('active', ['status','label','infer'][i] === name);
+  });
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+}
+
+// ─── Sensors ──────────────────────────────────────────────────────────────────
+async function loadSensors() {
+  try {
+    const j = await (await fetch('/api/sensors')).json();
+    for (const sel of [document.getElementById('labelSensorSel'), document.getElementById('inferSensorSel')]) {
+      j.sensors.forEach(s => {
+        const o = document.createElement('option');
+        o.value = s; o.textContent = s;
+        sel.appendChild(o);
+      });
+    }
+  } catch(e) {}
+}
+
+// ─── Status ───────────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const j = await (await fetch('/api/ml/status')).json();
+    const set = (id, val, cls) => {
+      const el = document.getElementById(id);
+      el.textContent = val;
+      el.className = 'card-value ' + cls;
+    };
+    set('cardOcc',        j.occupancy_model ? 'Loaded' : 'No model', j.occupancy_model ? 'good' : 'warn');
+    set('cardFever',      j.fever_model     ? 'Loaded' : 'No model', j.fever_model     ? 'good' : 'warn');
+    set('cardLabels',     j.n_labels,        j.n_labels >= 10 ? 'good' : 'warn');
+    set('cardFeverLabels',j.fever_label_count, j.fever_label_count >= 5 ? 'good' : 'idle');
+
+    const dist = j.occupancy_distribution || {};
+    document.getElementById('occDist').textContent =
+      Object.keys(dist).sort((a,b)=>+a-+b).map(k => k + ' people: ' + dist[k]).join('  |  ') || 'No labels yet.';
+
+    const trainBtn = document.getElementById('trainBtn');
+    const trainMsg = document.getElementById('trainMsg');
+    const t = j.training || {};
+    if (t.state === 'running') {
+      trainBtn.disabled = true;
+      trainMsg.textContent = t.message || 'Training…';
+      if (!statusPoll) statusPoll = setInterval(refreshStatus, 2000);
+    } else {
+      trainBtn.disabled = j.n_labels < 10;
+      trainMsg.textContent = t.state === 'done' ? ('Done: ' + t.message) : t.state === 'error' ? ('Error: ' + t.message) : '';
+      if (statusPoll && t.state !== 'running') { clearInterval(statusPoll); statusPoll = null; }
+    }
+
+    const logEl = document.getElementById('trainLog');
+    const lines = t.log || [];
+    logEl.textContent = lines.length ? lines.join('\\n') : (t.state === 'idle' ? 'No training run yet.' : t.message || '');
+    logEl.scrollTop = logEl.scrollHeight;
+
+    // Update label map from server
+    try {
+      const lj = await (await fetch('/api/ml/labels')).json();
+      labelMap = {};
+      (lj.labels || []).forEach(l => { labelMap[l.file] = l; });
+      // refresh grids if frames loaded
+      if (labelFrames.length) renderGrid('label');
+      if (inferFrames.length) renderGrid('infer');
+    } catch(e) {}
+  } catch(e) {}
+}
+
+async function startTraining() {
+  document.getElementById('trainBtn').disabled = true;
+  document.getElementById('trainMsg').textContent = 'Starting…';
+  try {
+    await fetch('/api/ml/train', {method:'POST'});
+    statusPoll = setInterval(refreshStatus, 2000);
+    await refreshStatus();
+  } catch(e) {
+    document.getElementById('trainMsg').textContent = 'Error: ' + e.message;
+  }
+}
+
+// ─── Frame loading ────────────────────────────────────────────────────────────
+async function loadFrames(tab) {
+  const sensor = document.getElementById(tab + 'SensorSel').value;
+  const dateVal = document.getElementById(tab + 'DateInput').value;
+  const date = dateVal ? dateVal.replace(/-/g,'') : '';
+  const params = new URLSearchParams({include_data: 'true', limit: '60'});
+  if (sensor) params.set('sensor_id', sensor);
+  if (date)   params.set('date', date);
+  try {
+    const j = await (await fetch('/api/thermal/history?' + params)).json();
+    const frames = j.data || [];
+    if (tab === 'label') {
+      labelFrames = frames;
+      if (tab === 'label') document.getElementById('labelCount').textContent = frames.length + ' frames loaded';
+      renderGrid('label');
+    } else {
+      inferFrames = frames;
+      renderGrid('infer');
+    }
+  } catch(e) {
+    console.error('loadFrames error', e);
+  }
+}
+
+// ─── Thermal canvas draw ──────────────────────────────────────────────────────
+function drawThermal(canvas, frameData, scale) {
+  if (!frameData || !frameData.pixels) return;
+  const W = frameData.width || 32, H = frameData.height || 24;
+  canvas.width = W * scale; canvas.height = H * scale;
+  const ctx = canvas.getContext('2d');
+  frameData.pixels.forEach(p => {
+    ctx.fillStyle = 'rgb(' + p.r + ',' + p.g + ',' + p.b + ')';
+    ctx.fillRect(p.col * scale, p.row * scale, scale, scale);
+  });
+}
+
+function drawThermalFromPixelArray(canvas, pixels, W, H, scale) {
+  canvas.width = W * scale; canvas.height = H * scale;
+  const ctx = canvas.getContext('2d');
+  pixels.forEach(p => {
+    ctx.fillStyle = 'rgb(' + p.r + ',' + p.g + ',' + p.b + ')';
+    ctx.fillRect(p.col * scale, p.row * scale, scale, scale);
+  });
+}
+
+// ─── Grid rendering ────────────────────────────────────────────────────────────
+function renderGrid(tab) {
+  const frames = tab === 'label' ? labelFrames : inferFrames;
+  const grid = document.getElementById(tab + 'Grid');
+  const selected = tab === 'label' ? labelSelected : inferSelected;
+  grid.innerHTML = '';
+  if (!frames.length) { grid.innerHTML = '<div class="empty-msg">No frames found.</div>'; return; }
+
+  frames.forEach(frame => {
+    const wrap = document.createElement('div');
+    wrap.className = 'thumb-wrap' + (frame.file === selected ? ' selected' : '');
+    wrap.onclick = () => selectFrame(tab, frame);
+
+    const c = document.createElement('canvas');
+    wrap.appendChild(c);
+    if (frame.data) drawThermal(c, frame.data, 2);
+
+    const lbl = labelMap[frame.file];
+    if (lbl) {
+      const dot = document.createElement('div');
+      dot.className = 'label-dot ' + (lbl.fever ? 'dot-fever' : 'dot-labelled');
+      dot.title = 'Labelled: ' + lbl.occupancy + ' person(s)' + (lbl.fever ? ', fever' : '');
+      wrap.appendChild(dot);
+    }
+
+    const ts = document.createElement('div');
+    ts.style.cssText = 'font-size:0.6rem;color:#475569;padding:2px 3px;background:#0f1117;';
+    ts.textContent = (frame.timestamp || '').substring(11,19);
+    wrap.appendChild(ts);
+
+    grid.appendChild(wrap);
+  });
+}
+
+// ─── Frame selection ──────────────────────────────────────────────────────────
+function selectFrame(tab, frame) {
+  if (tab === 'label') labelSelected = frame.file;
+  else                 inferSelected = frame.file;
+  renderGrid(tab);
+
+  const panel = document.getElementById(tab + 'Detail');
+  const existing = labelMap[frame.file];
+
+  const c = document.createElement('canvas');
+  if (frame.data) drawThermal(c, frame.data, 8);
+
+  const meta = document.createElement('div');
+  meta.style.cssText = 'font-size:0.75rem;color:#64748b;';
+  meta.textContent = frame.sensor_id + '  ·  ' + (frame.timestamp || '').replace('T',' ').substring(0,19);
+
+  if (tab === 'label') {
+    const occVal = existing ? existing.occupancy : 0;
+    const feverVal = existing ? existing.fever : false;
+    panel.innerHTML = '';
+    panel.appendChild(c);
+    panel.appendChild(meta);
+    panel.insertAdjacentHTML('beforeend', `
+      <div class="section-title">Label This Frame</div>
+      <div class="field-row">
+        <label>Occupancy:</label>
+        <input type="number" id="occInput" value="${occVal}" min="0" max="20">
+        <label><input type="checkbox" id="feverCb" ${feverVal?'checked':''}> Fever detected</label>
+      </div>
+      <button class="btn-success" onclick="saveLabel('${frame.file}')">Save Label</button>
+      ${existing ? '<div style="font-size:0.75rem;color:#4ade80">Currently labelled: ' + existing.occupancy + ' person(s)' + (existing.fever ? ', fever' : '') + '</div>' : ''}
+    `);
+  } else {
+    panel.innerHTML = '';
+    panel.appendChild(c);
+    panel.appendChild(meta);
+    panel.insertAdjacentHTML('beforeend', `
+      <button class="btn-primary" id="inferBtn" onclick="runInference('${frame.file}')">Run Inference</button>
+      <div id="inferResults"></div>
+    `);
+  }
+}
+
+// ─── Labelling ─────────────────────────────────────────────────────────────────
+async function saveLabel(file) {
+  const occ = parseInt(document.getElementById('occInput').value) || 0;
+  const fever = document.getElementById('feverCb').checked;
+  try {
+    await fetch('/api/ml/label', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({file, occupancy: occ, fever})
+    });
+    labelMap[file] = {file, occupancy: occ, fever};
+    renderGrid('label');
+    // Re-select to refresh panel
+    const frame = labelFrames.find(f => f.file === file);
+    if (frame) selectFrame('label', frame);
+    await refreshStatus();
+  } catch(e) { alert('Save failed: ' + e.message); }
+}
+
+// ─── Inference ────────────────────────────────────────────────────────────────
+async function runInference(file) {
+  const btn = document.getElementById('inferBtn');
+  btn.disabled = true; btn.textContent = 'Running…';
+  try {
+    const j = await (await fetch('/api/ml/infer?file=' + encodeURIComponent(file))).json();
+    const h = j.heuristic || {};
+    const m = j.ml || {};
+    const lbl = j.existing_label;
+
+    const fmtFever = v => v == null ? '<span class="badge badge-na">N/A</span>' :
+      v ? '<span class="badge badge-yes">Fever</span>' : '<span class="badge badge-no">None</span>';
+    const fmtOcc = v => v == null ? '—' : v;
+
+    const results = document.getElementById('inferResults');
+    results.innerHTML = `
+      <table class="result-table">
+        <tr><th></th><th>Occupancy</th><th>Fever</th><th>Confidence</th></tr>
+        <tr><td style="color:#94a3b8">Heuristic</td>
+            <td>${fmtOcc(h.occupancy)}</td>
+            <td>${fmtFever(h.any_fever)}</td>
+            <td>—</td></tr>
+        <tr><td style="color:#a78bfa">ML Model</td>
+            <td>${fmtOcc(m.ml_occupancy)}</td>
+            <td>${fmtFever(m.ml_fever)}</td>
+            <td>${m.ml_occupancy_confidence != null ? (m.ml_occupancy_confidence*100).toFixed(0)+'%' : '—'}</td></tr>
+        ${lbl ? '<tr><td style="color:#4ade80">Ground Truth</td><td>'+lbl.occupancy+'</td><td>'+fmtFever(lbl.fever)+'</td><td>—</td></tr>' : ''}
+      </table>
+      ${m.ml_occupancy == null ? '<div style="font-size:0.75rem;color:#f87171;margin-top:6px">No ML model loaded. Train a model first.</div>' : ''}
+    `;
+  } catch(e) {
+    document.getElementById('inferResults').innerHTML = '<div style="color:#f87171">Error: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Run Inference';
+  }
+}
+
+// ─── Init ──────────────────────────────────────────────────────────────────────
+loadSensors();
+refreshStatus();
 </script>
 </body>
 </html>"""

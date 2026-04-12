@@ -1,277 +1,286 @@
 # Occupancy API
 
-occupancy-api-b8hcb8hyh7f7aph3.canadacentral-01.azurewebsites.net
+**Live deployment:** https://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io
 
-FastAPI service for receiving and storing thermal camera data from ESP32 devices, with occupancy estimation and history.
+FastAPI service that receives thermal camera frames from ESP32 devices (MLX90640 32×24 sensor), estimates room occupancy and detects fever using heuristic algorithms and optional ML models, and stores data on Azure Blob Storage.
 
-**Azure:** Resource group `occupancy-rg`, App Service `occupancy-api`.
+**Azure:** Resource group `occupancy-rg`, Container App `occupancy-api-container`, Container Registry `occupancyregistry.azurecr.io`.
 
-## Endpoints
+---
+
+## Web interfaces
+
+| URL | Description |
+|-----|-------------|
+| `/` | Live thermal camera dashboard — real-time heatmap, occupancy badges, cluster overlays, per-sensor view |
+| `/ml` | ML Studio — label training data, train occupancy/fever models, run per-frame inference |
+| `/docs` | Auto-generated Swagger UI for all API endpoints |
+
+---
+
+## API endpoints
+
+### Health
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/test` | Health check |
-| POST | `/api/thermal` | Submit thermal data (compact or expanded JSON) |
-| GET | `/api/thermal` | Latest thermal data + occupancy (optionally `?sensor_id=...` for specific sensor) |
-| GET | `/api/sensors` | List all known sensor IDs |
-| GET | `/api/thermal/history` | Browse stored thermal frames (`?sensor_id=...`, `?date=YYYYMMDD`, `?limit=...`, `?offset=...`, `?include_data=true`) |
-| GET | `/api/occupancy/history` | Occupancy log for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
-| GET | `/api/occupancy/stats` | Occupancy stats for a date (`?date=YYYYMMDD`, `?sensor_id=...`) |
-| GET | `/api/occupancy/trends` | Occupancy and room temp by time bucket (`?date=...`, `?sensor_id=...`, `?bucket=hour\|day`) |
-| GET | `/api/occupancy/predict` | Predicted occupancy next 24–48h (`?sensor_id=...`, `?horizon_hours=24`) |
+| `GET` | `/api/test` | Health check — returns `{"status": "server is running", "time": "..."}` |
 
-## Local run
+### Thermal data
 
-Create the virtualenv once, then **always** `source .venv/bin/activate` before `python`, `uvicorn`, or the scripts under `scripts/` (same shell session as the command you run).
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/thermal` | Ingest a thermal frame from an ESP32. Accepts compact or expanded format. Returns occupancy result immediately. |
+| `GET` | `/api/thermal/current/poll` | Latest frame + occupancy for one sensor (`?sensor_id=`) or the most recently updated sensor |
+| `GET` | `/api/thermal/current/all` | Latest frame summary (building, occupancy, room temp) for **all** sensors |
+| `GET` | `/api/thermal/history` | Paginated list of stored frames. See [thermal history parameters](#thermal-history-parameters). |
+
+Legacy aliases (identical behaviour, kept for backwards compatibility):
+
+| Method | Path | Alias of |
+|--------|------|----------|
+| `GET` | `/api/thermal` | `/api/thermal/current/poll` |
+| `GET` | `/api/thermal/predicted/poll` | `/api/thermal/current/poll` |
+| `GET` | `/api/thermal/predicted/all` | `/api/thermal/current/all` |
+
+### Sensors
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/sensors` | List all known sensor IDs (from in-memory state and stored files) |
+
+### Occupancy
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/occupancy/history` | All occupancy log entries for a date (`?date=YYYYMMDD`, `?sensor_id=`) |
+| `GET` | `/api/occupancy/stats` | Aggregate statistics for a date: min, max, avg, current, distribution (`?date=`, `?sensor_id=`) |
+| `GET` | `/api/occupancy/trends` | Occupancy and room temperature bucketed by hour or day (`?date=`, `?sensor_id=`, `?bucket=hour\|day`) |
+| `GET` | `/api/occupancy/predict` | Heuristic 1–48 h occupancy forecast using same-hour averages from the past 7 days (`?sensor_id=`, `?horizon_hours=24`) |
+
+### ML Studio
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/ml/status` | Model load state, label counts, occupancy distribution, current training progress |
+| `GET` | `/api/ml/labels` | All stored ground-truth frame labels |
+| `POST` | `/api/ml/label` | Save or update a label: `{"file": "...", "occupancy": 2, "fever": false}` |
+| `GET` | `/api/ml/infer?file=<name>` | Run heuristic and ML inference on a stored frame; returns both results and any existing label |
+| `POST` | `/api/ml/train` | Trigger background model training from all labelled frames (requires ≥10 labels) |
+
+---
+
+## Thermal history parameters
+
+`GET /api/thermal/history` accepts:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sensor_id` | — | Filter to a specific sensor |
+| `date` | — | Filter to a date in `YYYYMMDD` format |
+| `limit` | `100` | Max frames returned (1–500) |
+| `offset` | `0` | Frames to skip (for pagination) |
+| `include_data` | `false` | When `true`, includes full expanded pixel data in each result |
+
+Pagination fields in the response: `has_more` (bool), `next_offset` (int or null).
+
+```bash
+# First page of metadata
+curl "https://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal/history?limit=100&offset=0"
+
+# Full frames from one sensor on a specific date
+curl "https://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal/history?sensor_id=room-a&date=20260412&include_data=true"
+```
+
+---
+
+## Submitting thermal data (POST /api/thermal)
+
+Compact format (sent by ESP32 firmware):
+
+```json
+{
+  "sensor_id": "room-a",
+  "w": 32,
+  "h": 24,
+  "min": 19.5,
+  "max": 34.2,
+  "t": [20.1, 20.3, ...]
+}
+```
+
+Fields `sensor_id`, `w`, and `h` are optional when the firmware always sends the same resolution. The `t` array is row-major, length `w × h`. Temperatures must be literal per-pixel values in degrees Celsius (floats or integers). The API does not decode 0–255 quantised arrays — if your firmware quantises readings via `min`/`max`, convert them back to degrees before submitting.
+
+The response includes the full occupancy result: `occupancy`, `room_temperature`, `people_clusters`, `fever_count`, `any_fever`, `any_elevated`, `frame_valid`, and ML predictions (when a model is loaded).
+
+---
+
+## How occupancy and fever detection work
+
+### Background subtraction
+
+Each sensor builds a per-sensor thermal background using an exponential moving average (EMA, weight `BACKGROUND_ALPHA`). The background is updated only when the room appears empty for at least `BACKGROUND_MIN_FRAMES_EMPTY` consecutive frames. Once a background exists, occupancy detection uses temperature *above background* rather than absolute temperature, reducing false positives from fixed heat sources like monitors or HVAC vents. Backgrounds are persisted as `background_<sensor_id>.npy`.
+
+### Clustering
+
+Pixels above the detection threshold are clustered using connected-component labelling (8-connected). Clusters smaller than `MIN_CLUSTER_SIZE` or larger than `MAX_CLUSTER_SIZE` are ignored. Each surviving cluster is one detected person. The cluster's representative temperature is its 90th percentile pixel.
+
+### Fever detection
+
+A cluster with representative temperature ≥ `FEVER_THRESHOLD_C` (default 37.5 °C) is a raw fever candidate. A cluster between `FEVER_ELEVATED_THRESHOLD_C` (default 37.0 °C) and the fever threshold is flagged as elevated. The public `any_fever` response field is gated by `FEVER_MIN_CONSECUTIVE_FRAMES` (default 2) to suppress single-frame noise.
+
+### Temporal smoothing
+
+After clustering, the server applies:
+
+1. **Frame sanity check** — if the frame-wide median temperature jumps more than `FRAME_ROOM_MEDIAN_MAX_JUMP_C` degrees from the previous frame, the raw count falls back to the last good value.
+2. **Median smoothing** — a rolling median over the last `OCCUPANCY_SMOOTH_WINDOW` raw counts.
+3. **Hysteresis** — changes smaller than `OCCUPANCY_HYSTERESIS_DELTA` from the last smoothed value are suppressed.
+
+Response fields for the three occupancy stages:
+
+| Field | Meaning |
+|-------|---------|
+| `occupancy_raw_instant` | Cluster count from this frame only |
+| `occupancy_effective_raw` | Raw count after frame sanity (invalid frames repeat last good count) |
+| `occupancy` | Final smoothed + hysteresis output — use this for stable room counts |
+| `frame_valid` | `false` when the median jump test rejected this frame |
+
+### ML inference (optional)
+
+When ONNX models are present (loaded from `ml_models/` or Azure Blob `ml/`), each frame is also run through a `GradientBoostingClassifier` trained on labelled historical frames. ML results appear under the `ml` key in the POST response:
+
+```json
+"ml": {
+  "ml_occupancy": 2,
+  "ml_occupancy_confidence": 0.87,
+  "ml_fever": false,
+  "ml_fever_confidence": 0.94
+}
+```
+
+The heuristic result is always present; ML results are additive and do not replace it.
+
+---
+
+## ML Studio workflow
+
+The `/ml` page lets teammates build and improve ML models without leaving the browser.
+
+### 1. Label Data tab
+
+Load stored thermal frames (filter by sensor and date). Each 32×24 frame is shown as a thumbnail. Click a frame to expand it, set the true occupancy count and whether fever was present, then Save. A green dot marks already-labelled frames; a red dot indicates a labelled fever frame. Labels persist across restarts and are synced to Azure Blob.
+
+### 2. Status & Train tab
+
+Shows whether occupancy and fever models are loaded, total labelled frame counts, and the occupancy distribution across labels. Once ≥10 frames are labelled, the Train button becomes active. Training runs in the background — the log updates live every 2 seconds. On completion the ONNX models are saved locally and uploaded to Azure Blob (`ml/occupancy_model.onnx`, `ml/fever_model.onnx`) and the inference engine reloads automatically.
+
+### 3. Run Inference tab
+
+Browse frames, select one, and click Run Inference to see a side-by-side comparison of the heuristic result, the ML model result (with confidence), and the stored ground-truth label if one exists.
+
+### Training offline
+
+For larger datasets, run the training script locally (requires `scikit-learn`, `skl2onnx`, `onnx`):
+
+```bash
+source .venv/bin/activate
+pip install scikit-learn skl2onnx onnx
+python scripts/train_ml_models.py --data-dir thermal_data --out-dir ml_models
+```
+
+Upload the resulting `.onnx` files to Azure Blob:
+
+```bash
+az storage blob upload -f ml_models/occupancy_model.onnx \
+  --container-name iotoccupancydata --name ml/occupancy_model.onnx \
+  --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
+```
+
+---
+
+## Local development
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Or with port from environment (e.g. Azure sets `PORT`):
+Visit `http://localhost:8000` for the dashboard and `http://localhost:8000/ml` for ML Studio.
+
+Install dev dependencies for running the test suite:
 
 ```bash
-source .venv/bin/activate
-PORT=8000 uvicorn main:app --host 0.0.0.0
+pip install -r requirements-dev.txt
+pytest tests/
 ```
 
-## Docker
+---
 
-Build and run locally:
+## Docker
 
 ```bash
 docker build -t occupancy-api .
 docker run -p 8000:8000 -e PORT=8000 occupancy-api
-```
 
-Optional: mount a host directory for persistent thermal/occupancy data:
-
-```bash
+# With persistent local storage
 docker run -p 8000:8000 -e PORT=8000 \
   -v "$(pwd)/thermal_data:/app/thermal_data" \
   occupancy-api
 ```
 
-The image uses `python main.py` so Azure’s `PORT` is respected when deployed.
-
-## Azure deployment (container)
-
-You can run the Docker image on **Azure App Service (Linux container)**, **Azure Container Apps**, or **Azure Container Instances**.
-
-### Option A: App Service with container
-
-1. **Build and push** the image to a registry (e.g. Azure Container Registry):
-
-   ```bash
-   az acr build --registry <your-acr-name> --image occupancy-api:latest .
-   ```
-
-2. In **App Service** → **Deployment Center** (or **Configuration** → **General settings**):
-   - Choose **Docker** → **Single Container**.
-   - Set **Registry source** to Azure Container Registry (or Docker Hub) and select `occupancy-api:latest`.
-   - Set **Target port** to **80** (App Service sets `PORT=80` by default; the app listens on whatever `PORT` is).
-
-3. Set **Application settings** (env vars): `AZURE_STORAGE_CONNECTION_STRING`, `THERMAL_DATA_DIR` (e.g. `/home/thermal_data` if using a mounted storage), and any of the optional variables listed below. App Service sets `PORT` automatically.
-
-4. **Persistent storage:** By default the container filesystem is ephemeral. For durable thermal/occupancy data either:
-   - Configure **Azure Blob** via `AZURE_STORAGE_CONNECTION_STRING` (recommended), or
-   - Use **App Service** → **Storage** to mount Azure Storage as a path (e.g. `/home/thermal_data`) and set `THERMAL_DATA_DIR=/home/thermal_data`.
-
-### Option B: Container Apps
-
-1. Build and push the image to ACR (or another registry).
-2. Create a Container App with the image. Set **Target port** to the value your platform uses for `PORT` (e.g. **80** for App Service, or **8000** if you set `PORT=8000` in app settings).
-3. Add the same environment variables; use Azure Blob for persistence or a volume mount if supported.
-
-### Option C: Auto-deploy container from GitHub
-
-A GitHub Actions workflow builds the Docker image, pushes it to Azure Container Registry (ACR), and deploys to App Service. Use the workflow in [.github/workflows/deploy-container.yml](.github/workflows/deploy-container.yml).
-
-**One-time setup**
-
-1. **Azure Container Registry**  
-   Create an ACR (e.g. in the same resource group as the app):
-   ```bash
-   az acr create --resource-group occupancy-rg --name myregistry --sku Basic --admin-enabled true
-   ```
-   Copy the **Login server** (e.g. `myregistry.azurecr.io`). In the repo, edit `.github/workflows/deploy-container.yml` and set `ACR_LOGIN_SERVER` to that value (e.g. `myregistry.azurecr.io`).
-
-2. **App Service as container**  
-   In Azure Portal → App Service **occupancy-api** → **Deployment Center** (or **Configuration** → **General settings**):
-   - **Publish:** Docker Container.
-   - **Registry:** Azure Container Registry; select your ACR and choose any image/tag for now (e.g. `occupancy-api:latest`). The workflow will overwrite it on each deploy.
-   - **Target port:** set to **80**. (App Service sets `PORT=80`; the app listens on that port.)
-   - Save. Ensure **Container settings** → **Startup Command** is empty (the image runs `python main.py`) or set to `python main.py`.
-
-3. **GitHub secrets**  
-   In the repo: **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
-   - `REGISTRY_USERNAME` – ACR **Username** (Azure Portal → ACR → **Access keys**).
-   - `REGISTRY_PASSWORD` – ACR **password** (from the same **Access keys** blade).
-   - `AZURE_CREDENTIALS` – service principal JSON so the workflow can update the App Service container. **Creating the SP and role assignment requires “Owner” or “User Access administrator” on the subscription or resource group.** If you get `AuthorizationFailed` on role assignment, ask an admin to run the steps below and share the JSON (or the `appId`/`password`/`tenant` values) with you.
-     **Option A – You have permission:** Create the SP (no deprecated flags):
-     ```bash
-     SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-     az ad sp create-for-rbac --name "github-occupancy-api" --role contributor \
-       --scopes /subscriptions/$SUBSCRIPTION_ID/resourceGroups/occupancy-rg
-     ```
-     From the output, build the secret value as one line (replace placeholders with the command output):
-     ```json
-     {"clientId":"<appId>","clientSecret":"<password>","subscriptionId":"<SUBSCRIPTION_ID>","tenantId":"<tenant>"}
-     ```
-     **Option B – Admin runs it:** An Owner/User Access admin runs the same `az ad sp create-for-rbac` command (no `--sdk-auth`), then builds the JSON above from `appId`, `password`, `tenant`, and your subscription ID, and gives you that JSON to store as `AZURE_CREDENTIALS`.
-
-4. **Optional:** Add application settings (env vars) in App Service → **Configuration** → **Application settings**, e.g. `AZURE_STORAGE_CONNECTION_STRING`, `THERMAL_DATA_DIR`, etc.
-
-After this, every push to `main` (or a manual **Run workflow** from the Actions tab) will build the image, push to ACR, and deploy to the Web App.
-
-### Environment variables (container / Azure)
-
-Set in App Service **Configuration** → **Application settings**, or as `-e` when running Docker locally:
-
-- `THERMAL_DATA_DIR` – directory for thermal and occupancy files (default: `thermal_data`; in the image: `/app/thermal_data`)
-- `SAVE_TO_BLOB` – write thermal/occupancy data to Azure Blob (default: `true` when `AZURE_STORAGE_CONNECTION_STRING` is set, else `false`)
-- `SAVE_LOCAL_DATA` – write thermal/occupancy data to local disk under `THERMAL_DATA_DIR` (default: `false` when Blob is enabled, else `true`)
-- `SAVE_THERMAL_DATA` – legacy alias for local writes (only used when `SAVE_LOCAL_DATA` is not set)
-- `PORT` – port to bind (Azure sets this automatically; default 8000 in the image)
-- `AZURE_STORAGE_CONNECTION_STRING` – if set, thermal and occupancy data are also written to Azure Blob Storage
-- `AZURE_STORAGE_CONTAINER_NAME` – blob container name (default: `iotoccupancydata`)
-- `BACKGROUND_ALPHA` – EMA weight for thermal background (default: `0.95`)
-- `BACKGROUND_MIN_FRAMES_EMPTY` – consecutive empty frames before updating background (default: `3`)
-- `BACKGROUND_MAX_MEAN_ABS_DELTA_C` – max mean absolute frame delta (°C) between consecutive **empty** frames to count toward background update; larger motion resets the empty streak (default: `2.5`; `0` disables the check)
-- `ROOM_TEMP_THRESHOLD` – degrees (°C) above room estimate a pixel must be to count as human heat in delta mode (default: `0.5`)
-- `FEVER_THRESHOLD_C` – temperature (°C) above which a cluster is flagged as fever (default: `37.5`)
-- `FEVER_ELEVATED_THRESHOLD_C` – lower band: cluster max temp between this and fever threshold is counted as elevated (default: `37.0`)
-- `FEVER_MIN_CONSECUTIVE_FRAMES` – `any_fever` in API output is true only after this many consecutive frames with raw fever (default: `2`)
-- `OCCUPANCY_SMOOTH_WINDOW` – median smoothing length over effective raw occupancy (default: `5`)
-- `OCCUPANCY_HYSTERESIS_DELTA` – suppress small oscillations: changes smaller than this from last smoothed value are held (default: `1`)
-- `FRAME_ROOM_MEDIAN_MAX_JUMP_C` – if the full-frame median temperature jumps more than this (°C) vs the previous frame, the frame is treated invalid and raw occupancy falls back to the last good value; final `occupancy` still uses the smoother (default: `4.0`; `0` disables)
-
-## Test
-
-**Script (recommended)** – exercises all endpoints and verifies storage:
-
-```bash
-export API_BASE_URL=https://occupancy-api.azurewebsites.net
-python test_api.py
-```
-
-Or pass the base URL as an argument:
-
-```bash
-python test_api.py https://occupancy-api.azurewebsites.net
-```
-
-**Manual curl:**
-
-```bash
-curl https://<occupancy-api>.azurewebsites.net/api/test
-curl -X POST https://<occupancy-api>.azurewebsites.net/api/thermal \
-  -H "Content-Type: application/json" \
-  -d '{"sensor_id":"test","w":32,"h":24,"min":20,"max":25,"t":[20.0]}'
-```
-
-## Data format (POST /api/thermal)
-
-Compact format from ESP32:
-
-- `sensor_id` (optional), `w`, `h`, `min`, `max`, `t` (list of temperatures, row-major)
-
-**Local storage:** thermal frames under `THERMAL_DATA_DIR` as compressed compact files `thermal_<sensor_id>_<timestamp>_compact.json.gz`; occupancy as `occupancy_YYYYMMDD.jsonl` with one JSON object per line.
-
-**Azure Blob Storage** (when `AZURE_STORAGE_CONNECTION_STRING` is set): thermal compact payloads are stored compressed under the `thermal/` prefix (e.g. `thermal/thermal_sensor1_20250107_120000_compact.json.gz`). Occupancy is appended to `occupancy/occupancy_YYYYMMDD.jsonl` (append blobs). By default, Blob is used as the durable store when configured.
-
-## Multi-sensor support
-
-The API tracks data from **all sensors** and makes it available via the endpoints:
-
-### Latest data per sensor
-
-- **`GET /api/thermal?sensor_id=<id>`** – Returns the latest thermal frame **for that specific sensor** (with occupancy).
-- **`GET /api/thermal`** (no `sensor_id`) – Returns the latest frame from whichever sensor posted most recently (backwards compatible).
-
-### List sensors
-
-- **`GET /api/sensors`** – Returns a list of all known sensor IDs (from in-memory state and stored files).
-
-### Browse stored thermal history
-
-- **`GET /api/thermal/history`** – Returns stored thermal frames from disk (all sensors by default).
-
-**Query parameters:**
-- `sensor_id` (optional) – Filter to frames from a specific sensor
-- `date=YYYYMMDD` (optional) – Filter to frames from a specific date
-- `limit` (default: 100, max: 500) – Maximum number of frames to return
-- `offset` (default: 0) – Number of matching frames to skip (for paging)
-- `include_data` (default: false) – If `true`, include full frame payload; compact stored frames are expanded on access. Each item then includes `source_format` (stored) and `returned_format` (payload shape); top-level `format` matches `returned_format`.
-
-**Examples:**
-- All sensors, newest 100 (metadata only): `GET /api/thermal/history`
-- One sensor with full frames: `GET /api/thermal/history?sensor_id=living-room&include_data=true`
-- All sensors for a specific day: `GET /api/thermal/history?date=20260207&limit=500`
-- Page through results: `GET /api/thermal/history?limit=50&offset=0`, then `?limit=50&offset=50`, etc.
-
-Pagination response fields:
-- `has_more` – `true` only when at least one more matching frame exists after this page
-- `next_offset` – offset to request the next page (or `null` when done)
-
-Example page loop:
-
-```bash
-# First page
-curl "https://<occupancy-api>.azurewebsites.net/api/thermal/history?limit=100&offset=0"
-
-# Example response fields:
-# {
-#   "count": 100,
-#   "has_more": true,
-#   "next_offset": 100,
-#   "data": [ ... ]
-# }
-
-# Next page (use next_offset from previous response)
-curl "https://<occupancy-api>.azurewebsites.net/api/thermal/history?limit=100&offset=100"
-```
-
-**Note:** The history endpoint reads from locally stored files under `THERMAL_DATA_DIR`. Each frame includes `timestamp` (server receive time) and `sensor_id` alongside the thermal data.
-
-## Server-side features
-
-### Background subtraction
-
-When the room is empty for several consecutive frames, the server updates a per-sensor thermal background (EMA). Occupancy detection then uses temperature *above* background to reduce false positives from equipment/HVAC. Backgrounds are persisted under `THERMAL_DATA_DIR` as `background_<sensor_id>.npy`.
-
-### Fever detection
-
-Each detected person cluster gets a representative temperature (90th percentile of pixels in the cluster). Clusters with representative temp **between** `FEVER_ELEVATED_THRESHOLD_C` and `FEVER_THRESHOLD_C` are tagged `elevated_temp`; clusters at or above `FEVER_THRESHOLD_C` are raw fever candidates (`fever_count`, `any_fever_raw`). The public `any_fever` flag is gated: it becomes true only after `FEVER_MIN_CONSECUTIVE_FRAMES` consecutive frames with raw fever, to reduce single-frame noise. Responses and occupancy JSONL include `elevated_count`, `any_elevated`, `any_fever_raw`, and `fever_consecutive_frames` where applicable.
-
-### Occupancy signal processing (temporal)
-
-After clustering, the server applies **frame sanity**, **median smoothing**, and **hysteresis** before exposing `occupancy`:
-
-| Field | Meaning |
-|--------|--------|
-| `occupancy_raw_instant` | Person count from clustering this frame |
-| `occupancy_effective_raw` | Same as raw if the frame is valid; if the frame fails the median jump check, repeats the last good raw count |
-| `occupancy` | Smoothed + hysteresis output (what clients should use for stable room counts) |
-| `frame_valid` | False when the median temperature jump test rejected the frame |
-
-These fields are stored in daily `occupancy_YYYYMMDD.jsonl` and returned from `POST /api/thermal` and `GET /api/thermal` (latest).
-
-### Trends and prediction
-
-- **`GET /api/occupancy/trends`** – Aggregates occupancy and room temperature by hour or day for a given date.
-- **`GET /api/occupancy/predict`** – Heuristic prediction for the next 1–48 hours using same hour-of-day average over the last 7 days.
-
-### Ground truth and calibration
-
-With labeled data you can score stored logs or replay thermal archives:
-
-- **`scripts/compare_occupancy_accuracy.py`** – CSV `timestamp,sensor_id,actual_count` vs `occupancy_*.jsonl`. Options `--field` and `--compare-fields` let you compare smoothed `occupancy`, `occupancy_effective_raw`, or `occupancy_raw_instant`.
-- **`scripts/compare_fever_accuracy.py`** – CSV `timestamp,sensor_id,fever` (0/1) vs fever flags in JSONL (`any_fever`, `any_fever_raw`, or `fever_count_positive`).
-- **`scripts/replay_thermal_occupancy.py`** – Re-run `thermal_*_compact.json(.gz)` through the pipeline offline (no writes by default); optional CSV export.
-- **`scripts/calibrate_occupancy_thresholds.py`** – Small grid over `ROOM_TEMP_THRESHOLD` / `MIN_CLUSTER_SIZE` using replay + the same alignment as the accuracy script.
-
-Details and examples: [scripts/README.md](scripts/README.md).
+---
+
+## Deployment (CI/CD)
+
+A GitHub Actions workflow builds the Docker image, pushes it to Azure Container Registry (`occupancyregistry.azurecr.io`), and deploys to the Container App on every push to `main`. Required GitHub secrets:
+
+| Secret | Value |
+|--------|-------|
+| `OCCUPANCYAPICONTAINER_AZURE_CLIENT_ID` | Service principal client ID |
+| `OCCUPANCYAPICONTAINER_AZURE_TENANT_ID` | Azure tenant ID |
+| `OCCUPANCYAPICONTAINER_AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
+| `OCCUPANCYAPICONTAINER_REGISTRY_USERNAME` | ACR username |
+| `OCCUPANCYAPICONTAINER_REGISTRY_PASSWORD` | ACR password |
+
+---
+
+## Environment variables
+
+Set in Container App environment or as `-e` flags when running Docker locally:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8000` | Port to bind (Azure sets this automatically) |
+| `THERMAL_DATA_DIR` | `thermal_data` | Directory for thermal frames and occupancy logs; in the image: `/app/thermal_data` |
+| `AZURE_STORAGE_CONNECTION_STRING` | — | Enables Azure Blob Storage for durable frame and label storage |
+| `AZURE_STORAGE_CONTAINER_NAME` | `iotoccupancydata` | Blob container name |
+| `SAVE_TO_BLOB` | `true` when connection string is set | Write data to Azure Blob |
+| `SAVE_LOCAL_DATA` | `false` when Blob is enabled | Write data to local disk. **Note:** the ML Studio (`/ml`) reads thermal frames from local disk via the history API; set this to `true` (and mount persistent storage) if you want ML Studio to work in a Blob-enabled deployment. |
+| `ML_MODEL_DIR` | `ml_models` | Local directory where ONNX models are cached |
+| `BACKGROUND_ALPHA` | `0.95` | EMA weight for thermal background update |
+| `BACKGROUND_MIN_FRAMES_EMPTY` | `3` | Consecutive empty frames before background update |
+| `BACKGROUND_MAX_MEAN_ABS_DELTA_C` | `2.5` | Max frame-to-frame delta (°C) between empty frames; larger resets the empty streak |
+| `ROOM_TEMP_THRESHOLD` | `0.5` | °C above room estimate (delta mode) a pixel must be to count as human |
+| `FEVER_THRESHOLD_C` | `37.5` | °C at or above which a cluster is flagged as fever |
+| `FEVER_ELEVATED_THRESHOLD_C` | `37.0` | Lower bound for the elevated-temperature band |
+| `FEVER_MIN_CONSECUTIVE_FRAMES` | `2` | Frames of consecutive raw fever before `any_fever` is set |
+| `OCCUPANCY_SMOOTH_WINDOW` | `5` | Rolling median window length for occupancy smoothing |
+| `OCCUPANCY_HYSTERESIS_DELTA` | `1` | Suppress occupancy changes smaller than this from the last smoothed value |
+| `FRAME_ROOM_MEDIAN_MAX_JUMP_C` | `4.0` | Max median temperature jump (°C) before a frame is marked invalid; `0` disables |
+
+---
+
+## Analysis scripts
+
+All scripts require the activated virtualenv (`source .venv/bin/activate`). See [scripts/README.md](scripts/README.md) for full usage.
+
+| Script | Description |
+|--------|-------------|
+| `scripts/compare_occupancy_accuracy.py` | Score stored occupancy logs against a CSV ground-truth file |
+| `scripts/compare_fever_accuracy.py` | Score fever flags against a CSV ground-truth file |
+| `scripts/replay_thermal_occupancy.py` | Re-run stored compact frames through the pipeline offline |
+| `scripts/calibrate_occupancy_thresholds.py` | Grid search over `ROOM_TEMP_THRESHOLD` / `MIN_CLUSTER_SIZE` |
+| `scripts/train_ml_models.py` | Train occupancy and fever ONNX models from labelled frame data |

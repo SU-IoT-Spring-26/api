@@ -5,3 +5,8 @@ scipy>=1.7.0
 azure-storage-blob>=12.19.0
 requests>=2.25.0
 pyodbc>=5.1.0
+# ML inference (onnxruntime CPU-only, ~10 MB — loaded only when models are present)
+onnxruntime>=1.17.0
+# ML training (used by the /ml Studio page to train models from labelled frames)
+scikit-learn>=1.4.0
+skl2onnx>=0.5.0

@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ML model binaries (downloaded from Blob at runtime; not committed)
+ml_models/
+*.onnx
+*.pkl

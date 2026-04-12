@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Application
 COPY main.py .
+COPY ml/ ml/
 
 # Default data directory inside container (can override with THERMAL_DATA_DIR)
 ENV THERMAL_DATA_DIR=/app/thermal_data
