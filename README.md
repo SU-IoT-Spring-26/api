@@ -109,7 +109,7 @@ Compact format (sent by ESP32 firmware):
 }
 ```
 
-Fields `sensor_id`, `w`, and `h` are optional when the firmware always sends the same resolution. The `t` array is row-major, length `w × h`. Temperatures can be floats, integers, or 0–255 quantised values (the server detects the format).
+Fields `sensor_id`, `w`, and `h` are optional when the firmware always sends the same resolution. The `t` array is row-major, length `w × h`. Temperatures must be literal per-pixel values in degrees Celsius (floats or integers). The API does not decode 0–255 quantised arrays — if your firmware quantises readings via `min`/`max`, convert them back to degrees before submitting.
 
 The response includes the full occupancy result: `occupancy`, `room_temperature`, `people_clusters`, `fever_count`, `any_fever`, `any_elevated`, `frame_valid`, and ML predictions (when a model is loaded).
 
@@ -258,7 +258,7 @@ Set in Container App environment or as `-e` flags when running Docker locally:
 | `AZURE_STORAGE_CONNECTION_STRING` | — | Enables Azure Blob Storage for durable frame and label storage |
 | `AZURE_STORAGE_CONTAINER_NAME` | `iotoccupancydata` | Blob container name |
 | `SAVE_TO_BLOB` | `true` when connection string is set | Write data to Azure Blob |
-| `SAVE_LOCAL_DATA` | `false` when Blob is enabled | Write data to local disk |
+| `SAVE_LOCAL_DATA` | `false` when Blob is enabled | Write data to local disk. **Note:** the ML Studio (`/ml`) reads thermal frames from local disk via the history API; set this to `true` (and mount persistent storage) if you want ML Studio to work in a Blob-enabled deployment. |
 | `ML_MODEL_DIR` | `ml_models` | Local directory where ONNX models are cached |
 | `BACKGROUND_ALPHA` | `0.95` | EMA weight for thermal background update |
 | `BACKGROUND_MIN_FRAMES_EMPTY` | `3` | Consecutive empty frames before background update |

@@ -11,7 +11,7 @@ API picks them up on next startup:
         --container-name iotoccupancydata --name ml/occupancy_model.onnx \\
         --connection-string "$AZURE_STORAGE_CONNECTION_STRING"
 
-Requirements (not in requirements.txt — install in your training environment):
+Requirements (included in requirements.txt; also installable standalone):
     pip install scikit-learn skl2onnx onnx onnxruntime
 
 The models will also work without ONNX if you save the sklearn estimator with

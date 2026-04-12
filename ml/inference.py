@@ -173,12 +173,17 @@ class MLInferenceEngine:
 
         features = extract(temp_array, background).reshape(1, -1)
 
+        # Snapshot sessions into locals so a concurrent load() call cannot
+        # change them between get_inputs() and run().
+        occ_sess = self._occ_session
+        fever_sess = self._fever_session
+
         occ_count = None
         occ_conf = None
-        if self._occ_session is not None:
+        if occ_sess is not None:
             try:
-                input_name = self._occ_session.get_inputs()[0].name
-                outputs = self._occ_session.run(None, {input_name: features})
+                input_name = occ_sess.get_inputs()[0].name
+                outputs = occ_sess.run(None, {input_name: features})
                 # outputs[0] = label array, outputs[1] = probability map
                 occ_count = int(outputs[0][0])
                 if len(outputs) > 1:
@@ -193,10 +198,10 @@ class MLInferenceEngine:
 
         fever_flag = None
         fever_conf = None
-        if self._fever_session is not None:
+        if fever_sess is not None:
             try:
-                input_name = self._fever_session.get_inputs()[0].name
-                outputs = self._fever_session.run(None, {input_name: features})
+                input_name = fever_sess.get_inputs()[0].name
+                outputs = fever_sess.run(None, {input_name: features})
                 fever_flag = bool(int(outputs[0][0]) == 1)
                 if len(outputs) > 1:
                     probs = outputs[1]

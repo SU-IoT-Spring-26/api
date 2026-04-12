@@ -1362,11 +1362,21 @@ def get_ml_labels_api() -> dict:
 
 
 @app.post("/api/ml/label")
+def _is_valid_thermal_filename(filename: str) -> bool:
+    return filename.startswith("thermal_") and (
+        filename.endswith("_compact.json") or filename.endswith("_compact.json.gz")
+    )
+
+
 def post_ml_label(req: _MLLabelRequest) -> dict:
     """Save or update a ground-truth label for a thermal frame file."""
     safe_file = Path(req.file).name
     if not safe_file:
         raise HTTPException(status_code=400, detail="Invalid filename")
+    if not _is_valid_thermal_filename(safe_file):
+        raise HTTPException(status_code=400, detail="file must match thermal_*_compact.json(.gz)")
+    if not (DATA_DIR / safe_file).is_file():
+        raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
     if not 0 <= req.occupancy <= 20:
         raise HTTPException(status_code=400, detail="occupancy must be 0–20")
     label_entry = {
@@ -1430,13 +1440,24 @@ def get_ml_infer(file: str = Query(..., description="Thermal frame filename")) -
 @app.post("/api/ml/train")
 def post_ml_train() -> dict:
     """Trigger a background model training run from all labelled frames."""
-    if _ml_training_status.get("state") == "running":
-        return {"status": "already_running", "training": _ml_training_status}
-    if len(_ml_labels) < 10:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Need at least 10 labelled frames to train; have {len(_ml_labels)}.",
-        )
+    global _ml_training_status
+    with _ml_training_lock:
+        if _ml_training_status.get("state") in {"starting", "running"}:
+            return {"status": "already_running", "training": dict(_ml_training_status)}
+        label_count = len(_ml_labels)
+        if label_count < 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Need at least 10 labelled frames to train; have {label_count}.",
+            )
+        # Mark as starting inside the lock so a concurrent request sees it
+        # before the thread has a chance to update it itself.
+        _ml_training_status = {
+            "state": "starting",
+            "message": "Starting training thread…",
+            "ts": datetime.now().isoformat(),
+            "log": [],
+        }
     t = threading.Thread(target=_run_training_thread, daemon=True)
     t.start()
     return {"status": "started"}
