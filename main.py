@@ -166,7 +166,7 @@ def _restore_state_from_disk() -> None:
         sensors = set(best_thermal) | set(best_occ)
         print(f"Restored state from disk for {len(sensors)} sensor(s): {sorted(sensors)}")
 
-    _load_ml_labels()
+    _load_ml_labels()  # called unconditionally — handles missing DATA_DIR gracefully
 
 
 app.add_middleware(
@@ -249,8 +249,14 @@ _ml_training_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
-    """Load persisted ML frame labels from disk into _ml_labels."""
+    """Load persisted ML frame labels from disk into _ml_labels.
+
+    Called unconditionally at startup — DATA_DIR may not exist in Blob-only
+    mode, in which case local load is simply skipped.
+    """
     global _ml_labels
+    if not DATA_DIR.exists():
+        return
     path = DATA_DIR / "ml_labels.jsonl"
     if not path.exists():
         return
@@ -270,16 +276,20 @@ def _load_ml_labels() -> None:
 
 
 def _persist_ml_labels() -> None:
-    """Rewrite ml_labels.jsonl from the in-memory dict and sync to Blob."""
-    if not SAVE_LOCAL_DATA:
-        return
-    path = DATA_DIR / "ml_labels.jsonl"
-    try:
-        with open(path, "w") as f:
-            for entry in _ml_labels.values():
-                f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-    except Exception as e:
-        print(f"Error saving ML labels: {e}")
+    """Rewrite ml_labels.jsonl from the in-memory dict and sync to Blob.
+
+    Local write and Blob upload are independent: Blob-only deployments
+    (SAVE_LOCAL_DATA=false) still persist labels to Azure Blob.
+    """
+    if SAVE_LOCAL_DATA:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        path = DATA_DIR / "ml_labels.jsonl"
+        try:
+            with open(path, "w") as f:
+                for entry in _ml_labels.values():
+                    f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        except Exception as e:
+            print(f"Error saving ML labels locally: {e}")
     if SAVE_TO_BLOB:
         try:
             content = "".join(
@@ -1356,7 +1366,8 @@ def post_ml_label(req: _MLLabelRequest) -> dict:
         "fever": req.fever,
         "ts": datetime.now().isoformat(),
     }
-    _ml_labels[safe_file] = label_entry
+    with _ml_training_lock:
+        _ml_labels[safe_file] = label_entry
     _persist_ml_labels()
     return {"status": "ok", "label": label_entry}
 
@@ -1429,30 +1440,37 @@ def _run_training_thread() -> None:
 
     def log(msg: str) -> None:
         log_lines.append(msg)
-        _ml_training_status = {**_ml_training_status, "message": msg, "log": list(log_lines)}
+        with _ml_training_lock:
+            _ml_training_status = {**_ml_training_status, "message": msg, "log": list(log_lines)}
         print(f"[ML Train] {msg}")
 
-    _ml_training_status = {"state": "running", "message": "Starting…", "ts": datetime.now().isoformat(), "log": []}
+    with _ml_training_lock:
+        _ml_training_status = {"state": "running", "message": "Starting…", "ts": datetime.now().isoformat(), "log": []}
 
     try:
         from sklearn.ensemble import GradientBoostingClassifier  # noqa: PLC0415
         from sklearn.model_selection import cross_val_score  # noqa: PLC0415
     except ImportError:
-        _ml_training_status = {
-            "state": "error",
-            "message": "scikit-learn not installed. Add it to requirements.txt and redeploy.",
-            "ts": datetime.now().isoformat(),
-            "log": log_lines,
-        }
+        with _ml_training_lock:
+            _ml_training_status = {
+                "state": "error",
+                "message": "scikit-learn not installed. Add it to requirements.txt and redeploy.",
+                "ts": datetime.now().isoformat(),
+                "log": log_lines,
+            }
         return
 
     try:
         from ml.features import extract as _ml_extract  # noqa: PLC0415
     except ImportError as e:
-        _ml_training_status = {"state": "error", "message": f"ml package unavailable: {e}", "ts": datetime.now().isoformat(), "log": log_lines}
+        with _ml_training_lock:
+            _ml_training_status = {"state": "error", "message": f"ml package unavailable: {e}", "ts": datetime.now().isoformat(), "log": log_lines}
         return
 
-    labels_snap = list(_ml_labels.values())
+    # Snapshot labels under lock so concurrent POST /api/ml/label can't mutate
+    # the dict during iteration or produce inconsistent training data.
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
     log(f"Building features for {len(labels_snap)} labelled frames…")
     features, occ_targets, fever_targets = [], [], []
 
@@ -1474,18 +1492,19 @@ def _run_training_thread() -> None:
 
     n = len(features)
     if n < 10:
-        _ml_training_status = {
-            "state": "error",
-            "message": f"Only {n} usable feature vectors (need 10+). Check that labelled files still exist.",
-            "ts": datetime.now().isoformat(),
-            "log": log_lines,
-        }
+        with _ml_training_lock:
+            _ml_training_status = {
+                "state": "error",
+                "message": f"Only {n} usable feature vectors (need 10+). Check that labelled files still exist.",
+                "ts": datetime.now().isoformat(),
+                "log": log_lines,
+            }
         return
 
     X = np.array(features, dtype=np.float32)
     y_occ = np.array(occ_targets)
     y_fever = np.array(fever_targets)
-    out_dir = Path("ml_models")
+    out_dir = Path(os.environ.get("ML_MODEL_DIR", "ml_models"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"Training occupancy model on {n} samples (classes: {sorted(set(occ_targets))})…")
@@ -1518,12 +1537,13 @@ def _run_training_thread() -> None:
     if _ml_engine:
         _ml_engine.load(blob_container=_get_blob_container())
 
-    _ml_training_status = {
-        "state": "done",
-        "message": f"Trained on {n} samples.",
-        "ts": datetime.now().isoformat(),
-        "log": log_lines,
-    }
+    with _ml_training_lock:
+        _ml_training_status = {
+            "state": "done",
+            "message": f"Trained on {n} samples.",
+            "ts": datetime.now().isoformat(),
+            "log": log_lines,
+        }
 
 
 def _export_onnx_model(clf, n_features: int, out_path: Path, name: str, log) -> None:

@@ -240,10 +240,10 @@ A GitHub Actions workflow builds the Docker image, pushes it to Azure Container 
 | Secret | Value |
 |--------|-------|
 | `OCCUPANCYAPICONTAINER_AZURE_CLIENT_ID` | Service principal client ID |
-| `_AZURE_TENANT_ID` | Azure tenant ID |
-| `_AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
-| `_REGISTRY_USERNAME` | ACR username |
-| `_REGISTRY_PASSWORD` | ACR password |
+| `OCCUPANCYAPICONTAINER_AZURE_TENANT_ID` | Azure tenant ID |
+| `OCCUPANCYAPICONTAINER_AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
+| `OCCUPANCYAPICONTAINER_REGISTRY_USERNAME` | ACR username |
+| `OCCUPANCYAPICONTAINER_REGISTRY_PASSWORD` | ACR password |
 
 ---
 

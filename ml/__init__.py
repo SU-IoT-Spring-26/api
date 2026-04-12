@@ -14,8 +14,8 @@ This keeps latency near zero and avoids any per-request cost or rate limits.
 
 Retraining pipeline
 -------------------
-Intended to run as a Modal cron job (see scripts/retrain_modal.py) or manually
-via scripts/train_ml_models.py. The pipeline:
+Run manually via scripts/train_ml_models.py (or trigger from the ML Studio
+web UI at /ml). The pipeline:
   1. Pulls compact thermal frames + occupancy JSONL from Azure Blob.
   2. Builds feature vectors (see ml/features.py).
   3. Trains sklearn GradientBoostingClassifier (occupancy) and

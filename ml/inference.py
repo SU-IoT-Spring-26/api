@@ -7,7 +7,7 @@ Usage in main.py
     _ml = MLInferenceEngine()
 
     # at startup (inside lifespan or startup event):
-    await _ml.load(blob_container_client, local_model_dir)
+    _ml.load(blob_container_client)
 
     # per frame:
     result = _ml.predict(temp_array_2d, background_array)
@@ -15,14 +15,14 @@ Usage in main.py
 
 Models
 ------
-Two ONNX models, each a binary GradientBoosting classifier exported via skl2onnx:
+Two ONNX models exported via skl2onnx from GradientBoosting classifiers:
 
-  occupancy_model.onnx
+  occupancy_model.onnx  — multi-class classifier
     input:  float32 (1, N_FEATURES)
-    output: label (int64) — predicted occupancy count (capped at MAX_OCCUPANCY)
+    output: label (int64) — predicted occupancy count
             probabilities (float32, N_CLASSES)
 
-  fever_model.onnx
+  fever_model.onnx  — binary classifier
     input:  float32 (1, N_FEATURES)
     output: label (int64) — 1 if any fever likely, 0 otherwise
             probabilities (float32, 2)
@@ -32,7 +32,6 @@ Both models are optional; whichever is present is used.
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 from pathlib import Path

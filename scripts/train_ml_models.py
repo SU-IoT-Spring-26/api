@@ -71,7 +71,7 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
         return features, occ_labels, fever_labels
 
     # Load occupancy log index (date → {timestamp → occupancy})
-    occ_index: dict[str, int] = {}
+    occ_index: dict[str, tuple[int, int]] = {}  # ts_prefix → (occupancy, fever)
     for occ_file in sorted(data_dir.glob("occupancy_*.jsonl*")):
         opener = gzip.open if occ_file.suffix == ".gz" else open
         try:
@@ -155,7 +155,6 @@ def train_and_export(
     try:
         from sklearn.ensemble import GradientBoostingClassifier
         from sklearn.model_selection import cross_val_score
-        from sklearn.preprocessing import LabelEncoder
     except ImportError:
         print("scikit-learn not installed. Run: pip install scikit-learn skl2onnx onnx")
         sys.exit(1)
@@ -174,8 +173,14 @@ def train_and_export(
     print("\n--- Occupancy model ---")
     print(f"  Classes: {sorted(set(y_occ))}, samples: {len(y_occ)}")
     occ_clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
-    scores = cross_val_score(occ_clf, X, y_occ, cv=min(5, len(X) // 5), scoring="accuracy")
-    print(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
+    from collections import Counter as _Counter
+    min_occ_class = min(_Counter(y_occ).values())
+    cv_occ = min(5, len(X) // 5, min_occ_class)
+    try:
+        scores = cross_val_score(occ_clf, X, y_occ, cv=cv_occ, scoring="accuracy")
+        print(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
+    except ValueError as e:
+        print(f"  CV skipped ({e})")
     occ_clf.fit(X, y_occ)
     _export_onnx(occ_clf, X.shape[1], out_dir / "occupancy_model.onnx", "occupancy_model")
     if SAVE_SKLEARN_PICKLE:
@@ -191,8 +196,12 @@ def train_and_export(
         print("  Too few fever-positive samples to train a useful model. Skipping.")
     else:
         fever_clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
-        scores = cross_val_score(fever_clf, X, y_fever, cv=min(5, len(X) // 5), scoring="f1")
-        print(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
+        cv_fever = min(5, len(X) // 5, fever_pos, len(y_fever) - fever_pos)
+        try:
+            scores = cross_val_score(fever_clf, X, y_fever, cv=cv_fever, scoring="f1")
+            print(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
+        except ValueError as e:
+            print(f"  CV skipped ({e})")
         fever_clf.fit(X, y_fever)
         _export_onnx(fever_clf, X.shape[1], out_dir / "fever_model.onnx", "fever_model")
         if SAVE_SKLEARN_PICKLE:
