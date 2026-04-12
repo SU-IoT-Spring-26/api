@@ -52,7 +52,10 @@ def extract(temp_array: np.ndarray, background: np.ndarray | None = None) -> np.
     # Normalise pixels
     pixels_norm = np.clip((arr - 15.0) / 25.0, 0.0, 1.0).flatten()  # (768,)
 
-    stats = _stats(arr, background)
+    # Only pass background when it matches arr's shape after any reshape/pad;
+    # otherwise _background_stats would misbroadcast or raise.
+    bg = background if (background is not None and background.shape == arr.shape) else None
+    stats = _stats(arr, bg)
     return np.concatenate([pixels_norm, stats]).astype(np.float32)
 
 

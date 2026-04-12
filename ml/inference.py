@@ -57,6 +57,18 @@ class MLInferenceEngine:
         self._loaded = False
 
     # ------------------------------------------------------------------
+    # Public status properties
+    # ------------------------------------------------------------------
+
+    @property
+    def occupancy_model_loaded(self) -> bool:
+        return self._occ_session is not None
+
+    @property
+    def fever_model_loaded(self) -> bool:
+        return self._fever_session is not None
+
+    # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
 

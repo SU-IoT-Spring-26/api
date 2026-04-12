@@ -280,20 +280,24 @@ def _persist_ml_labels() -> None:
 
     Local write and Blob upload are independent: Blob-only deployments
     (SAVE_LOCAL_DATA=false) still persist labels to Azure Blob.
+    A consistent snapshot is taken under lock so concurrent label POSTs
+    cannot cause RuntimeError or partial writes.
     """
+    with _ml_training_lock:
+        snapshot = list(_ml_labels.values())
     if SAVE_LOCAL_DATA:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         path = DATA_DIR / "ml_labels.jsonl"
         try:
             with open(path, "w") as f:
-                for entry in _ml_labels.values():
+                for entry in snapshot:
                     f.write(json.dumps(entry, separators=(",", ":")) + "\n")
         except Exception as e:
             print(f"Error saving ML labels locally: {e}")
     if SAVE_TO_BLOB:
         try:
             content = "".join(
-                json.dumps(e, separators=(",", ":")) + "\n" for e in _ml_labels.values()
+                json.dumps(e, separators=(",", ":")) + "\n" for e in snapshot
             )
             _upload_blob("ml/labels.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
         except Exception as e:
@@ -1330,26 +1334,31 @@ class _MLLabelRequest(BaseModel):
 @app.get("/api/ml/status")
 def get_ml_status() -> dict:
     """ML model status, label counts, and training progress."""
-    occ_loaded = bool(_ml_engine and _ml_engine._occ_session is not None)
-    fever_loaded = bool(_ml_engine and _ml_engine._fever_session is not None)
+    occ_loaded = bool(_ml_engine and _ml_engine.occupancy_model_loaded)
+    fever_loaded = bool(_ml_engine and _ml_engine.fever_model_loaded)
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
+        training_snap = dict(_ml_training_status)
     occ_dist: Dict[str, int] = {}
-    for v in _ml_labels.values():
+    for v in labels_snap:
         k = str(v.get("occupancy", 0))
         occ_dist[k] = occ_dist.get(k, 0) + 1
     return {
         "occupancy_model": occ_loaded,
         "fever_model": fever_loaded,
-        "n_labels": len(_ml_labels),
-        "fever_label_count": sum(1 for v in _ml_labels.values() if v.get("fever")),
+        "n_labels": len(labels_snap),
+        "fever_label_count": sum(1 for v in labels_snap if v.get("fever")),
         "occupancy_distribution": occ_dist,
-        "training": _ml_training_status,
+        "training": training_snap,
     }
 
 
 @app.get("/api/ml/labels")
 def get_ml_labels_api() -> dict:
     """Return all stored frame labels."""
-    return {"labels": list(_ml_labels.values()), "count": len(_ml_labels)}
+    with _ml_training_lock:
+        labels_snap = list(_ml_labels.values())
+    return {"labels": labels_snap, "count": len(labels_snap)}
 
 
 @app.post("/api/ml/label")

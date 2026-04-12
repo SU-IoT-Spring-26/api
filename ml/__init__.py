@@ -16,12 +16,14 @@ Retraining pipeline
 -------------------
 Run manually via scripts/train_ml_models.py (or trigger from the ML Studio
 web UI at /ml). The pipeline:
-  1. Pulls compact thermal frames + occupancy JSONL from Azure Blob.
+  1. Reads compact thermal frames and ground-truth labels from local
+     THERMAL_DATA_DIR (the same directory the API writes to).
   2. Builds feature vectors (see ml/features.py).
-  3. Trains sklearn GradientBoostingClassifier (occupancy) and
-     GradientBoostingClassifier (fever).
+  3. Trains sklearn GradientBoostingClassifier (occupancy, multi-class) and
+     GradientBoostingClassifier (fever, binary).
   4. Exports both to ONNX via skl2onnx.
-  5. Uploads to Azure Blob: ml/occupancy_model.onnx, ml/fever_model.onnx.
+  5. Saves models to ML_MODEL_DIR and uploads to Azure Blob:
+     ml/occupancy_model.onnx, ml/fever_model.onnx.
 """
 
 from ml.inference import MLInferenceEngine
