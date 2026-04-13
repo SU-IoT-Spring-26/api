@@ -1197,6 +1197,11 @@ def get_thermal_data(
             out["any_fever_raw"] = occ.get("any_fever_raw", False)
             out["any_elevated"] = occ.get("any_elevated", False)
             out["fever_consecutive_frames"] = occ.get("fever_consecutive_frames", 0)
+            ml = occ.get("ml") or {}
+            out["ml_occupancy"] = ml.get("ml_occupancy")
+            out["ml_occupancy_confidence"] = ml.get("ml_occupancy_confidence")
+            out["ml_fever"] = ml.get("ml_fever")
+            out["ml_fever_confidence"] = ml.get("ml_fever_confidence")
         return out
 
     if latest_thermal_data is None:
@@ -1218,6 +1223,11 @@ def get_thermal_data(
         out["any_fever_raw"] = latest_occupancy.get("any_fever_raw", False)
         out["any_elevated"] = latest_occupancy.get("any_elevated", False)
         out["fever_consecutive_frames"] = latest_occupancy.get("fever_consecutive_frames", 0)
+        ml = latest_occupancy.get("ml") or {}
+        out["ml_occupancy"] = ml.get("ml_occupancy")
+        out["ml_occupancy_confidence"] = ml.get("ml_occupancy_confidence")
+        out["ml_fever"] = ml.get("ml_fever")
+        out["ml_fever_confidence"] = ml.get("ml_fever_confidence")
     return out
 
 
@@ -1779,6 +1789,8 @@ def visualization_page() -> str:
   .badge-fever { background: #7f1d1d; color: #fecaca; }
   .badge-elevated { background: #78350f; color: #fde68a; }
   .badge-ok { background: #1e293b; color: #94a3b8; }
+  .badge-ml { background: #312e81; color: #c7d2fe; }
+  .badge-ml-na { background: #1e293b; color: #475569; }
   .canvas-wrap { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
   canvas { image-rendering: pixelated; border: 1px solid #2d3748; border-radius: 4px; }
   #legend { display: flex; flex-direction: column; gap: 4px; }
@@ -1786,6 +1798,9 @@ def visualization_page() -> str:
   .legend-label { font-size: 0.7rem; color: #94a3b8; }
   #status { margin-top: 14px; font-size: 0.8rem; color: #64748b; }
   .stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .stats-section { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .stats-divider { width: 1px; height: 20px; background: #2d3748; margin: 0 4px; }
+  .stats-label { font-size: 0.7rem; color: #475569; text-transform: uppercase; letter-spacing: .05em; }
 </style>
 </head>
 <body>
@@ -1892,16 +1907,32 @@ function renderFrame(data) {
   const occ  = data.occupancy ?? '—';
   const temp = data.room_temperature != null ? data.room_temperature.toFixed(1) + ' °C' : '—';
   const feverBadge = data.any_fever
-    ? badge('badge-fever', '🌡 Fever detected')
+    ? badge('badge-fever', 'Fever detected')
     : data.any_elevated
-      ? badge('badge-elevated', '⚠ Elevated temp')
+      ? badge('badge-elevated', 'Elevated temp')
       : badge('badge-ok', 'No fever');
 
+  // ML inference badges
+  let mlBadge = '';
+  if (data.ml_occupancy != null) {
+    const conf = data.ml_occupancy_confidence != null
+      ? ` (${(data.ml_occupancy_confidence * 100).toFixed(0)}%)`
+      : '';
+    mlBadge = badge('badge-ml', `ML: ${data.ml_occupancy} ${data.ml_occupancy === 1 ? 'person' : 'people'}${conf}`);
+  } else {
+    mlBadge = badge('badge-ml-na', 'ML: no model');
+  }
+
   statsEl.innerHTML =
-    badge('badge-occ',  `👤 ${occ} ${occ === 1 ? 'person' : 'people'}`) + ' ' +
-    badge('badge-temp', `🌡 Room ${temp}`) + ' ' +
+    '<span class="stats-label">Heuristic</span> ' +
+    badge('badge-occ',  `${occ} ${occ === 1 ? 'person' : 'people'}`) + ' ' +
+    badge('badge-temp', `Room ${temp}`) + ' ' +
     feverBadge +
-    (data.frame_valid === false ? ' ' + badge('badge-elevated', 'Frame invalid') : '');
+    (data.frame_valid === false ? ' ' + badge('badge-elevated', 'Frame invalid') : '') +
+    '<span class="stats-divider"></span>' +
+    '<span class="stats-label">ML</span> ' +
+    mlBadge +
+    (data.ml_fever != null ? ' ' + (data.ml_fever ? badge('badge-fever', 'ML fever') : badge('badge-ok', 'ML no fever')) : '');
 
   const ts = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '—';
   statusEl.textContent = `Last update: ${ts}  ·  ${W}×${H} px`;
