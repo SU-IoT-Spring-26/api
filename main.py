@@ -1648,8 +1648,8 @@ def _run_training_thread() -> None:
 
     for lbl in labels_snap:
         try:
-            path = DATA_DIR / lbl["file"]
-            if not path.exists():
+            path = _ensure_local_copy(lbl["file"])
+            if path is None:
                 log(f"  Skipping missing file: {lbl['file']}")
                 continue
             payload = _read_json_payload(path)
