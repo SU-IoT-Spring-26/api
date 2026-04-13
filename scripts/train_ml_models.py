@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ml.features import extract  # noqa: E402
 
 SAVE_SKLEARN_PICKLE = False  # set True to also save .pkl alongside .onnx
+_MAX_UNMATCHED_WARNINGS = 10  # cap noisy per-frame warnings in load_dataset()
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,7 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
                     occ = entry.get("occupancy")
                     sensor = entry.get("sensor_id", "")
                     fever = 1 if entry.get("any_fever") else 0
-                    if ts and occ is not None:
+                    if ts and occ is not None and sensor:
                         occ_index[(sensor, str(ts)[:19])] = (int(occ), int(fever))
         except Exception as exc:
             print(f"Warning: could not read {occ_file}: {exc}")
@@ -94,7 +95,6 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
     loaded = 0
     matched_count = 0
     unmatched_warnings = 0
-    _MAX_UNMATCHED_WARNINGS = 10
     for path in compact_files:
         try:
             opener = gzip.open if path.name.endswith(".gz") else open
