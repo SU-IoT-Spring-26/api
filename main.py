@@ -896,9 +896,11 @@ def _ensure_local_copy(filename: str) -> Optional[Path]:
             return local_path
         except Exception:
             import tempfile
-            tmp = Path(tempfile.mktemp(suffix=Path(filename).suffix))
-            tmp.write_bytes(data)
-            return tmp
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(filename).suffix, delete=False
+            ) as tf:
+                tf.write(data)
+                return Path(tf.name)
     except Exception:
         return None
 
@@ -1648,7 +1650,8 @@ def _run_training_thread() -> None:
 
     for lbl in labels_snap:
         try:
-            path = _ensure_local_copy(lbl["file"])
+            safe_file = Path(lbl["file"]).name
+            path = _ensure_local_copy(safe_file)
             if path is None:
                 log(f"  Skipping missing file: {lbl['file']}")
                 continue

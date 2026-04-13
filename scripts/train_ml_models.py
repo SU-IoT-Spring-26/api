@@ -93,6 +93,8 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
 
     loaded = 0
     matched_count = 0
+    unmatched_warnings = 0
+    _MAX_UNMATCHED_WARNINGS = 10
     for path in compact_files:
         try:
             opener = gzip.open if path.name.endswith(".gz") else open
@@ -125,7 +127,7 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
             arr = np.array(temps, dtype=np.float32).reshape(h, w)
 
             # Match to occupancy log by sensor_id + timestamp in filename.
-            # filename: thermal_<sensor>_<YYYYMMDD_HHMMSS>_compact.json(.gz)
+            # filename: thermal_<sensor>_<YYYYMMDD>_<HHMMSS>_<ms>_compact.json(.gz)
             ts_str = None
             parts = path.stem.replace(".json", "").split("_")
             for i, p in enumerate(parts):
@@ -149,11 +151,16 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
             if matched:
                 matched_count += 1
             else:
-                print(f"  Warning: no occupancy log match for {path.name} (sensor={sensor_id!r}, ts={ts_str})")
+                unmatched_warnings += 1
+                if unmatched_warnings <= _MAX_UNMATCHED_WARNINGS:
+                    print(f"  Warning: no occupancy log match for {path.name} (sensor={sensor_id!r}, ts={ts_str})")
         except Exception as exc:
             print(f"Warning: skipping {path.name}: {exc}")
 
-    print(f"Loaded {loaded} frames from {data_dir} ({matched_count} matched occupancy log, {loaded - matched_count} defaulted to occupancy=0)")
+    unmatched = loaded - matched_count
+    if unmatched_warnings > _MAX_UNMATCHED_WARNINGS:
+        print(f"  ... and {unmatched_warnings - _MAX_UNMATCHED_WARNINGS} more unmatched frame(s) (suppressed)")
+    print(f"Loaded {loaded} frames from {data_dir} ({matched_count} matched occupancy log, {unmatched} defaulted to occupancy=0)")
     return features, occ_labels, fever_labels
 
 
