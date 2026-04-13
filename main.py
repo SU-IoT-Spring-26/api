@@ -809,6 +809,100 @@ def _iter_thermal_files() -> List[Path]:
     return files
 
 
+def _parse_thermal_blob_meta(filename: str) -> tuple:
+    """Parse (safe_id, timestamp_iso) from a thermal frame filename.
+
+    Pattern: thermal_{safe_id}_{YYYYMMDD}_{HHMMSS}_{ms}_compact.json(.gz)
+    Returns ("", "") when the filename does not match.
+    """
+    stem = filename
+    for suffix in ("_compact.json.gz", "_compact.json"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    parts = stem.split("_")
+    for i, p in enumerate(parts):
+        if (
+            len(p) == 8
+            and p.isdigit()
+            and i + 1 < len(parts)
+            and len(parts[i + 1]) == 6
+            and parts[i + 1].isdigit()
+        ):
+            date_p, time_p = p, parts[i + 1]
+            ts_iso = (
+                f"{date_p[:4]}-{date_p[4:6]}-{date_p[6:]}"
+                f"T{time_p[:2]}:{time_p[2:4]}:{time_p[4:]}"
+            )
+            safe_id = "_".join(parts[1:i])
+            return safe_id, ts_iso
+    return "", ""
+
+
+def _list_blob_thermal_names(
+    sensor_id_filter: Optional[str] = None,
+    date_filter: Optional[str] = None,
+) -> List[str]:
+    """List thermal frame filenames stored in Azure Blob under the thermal/ prefix.
+
+    Returns bare filenames (no path prefix), sorted newest-first.
+    Results are pre-filtered by date and sensor_id when supplied to avoid
+    downloading any blob content.
+    """
+    container = _get_blob_container()
+    if container is None:
+        return []
+    safe_filter = _sanitize_sensor_id_for_filename(sensor_id_filter) if sensor_id_filter else None
+    try:
+        blobs = container.list_blobs(name_starts_with="thermal/")
+        names: List[str] = []
+        for blob in blobs:
+            filename = blob.name[len("thermal/"):]
+            if not filename.startswith("thermal_"):
+                continue
+            if not (filename.endswith("_compact.json.gz") or filename.endswith("_compact.json")):
+                continue
+            if date_filter and date_filter not in filename:
+                continue
+            if safe_filter:
+                blob_safe_id, _ = _parse_thermal_blob_meta(filename)
+                if blob_safe_id != safe_filter:
+                    continue
+            names.append(filename)
+        names.sort(reverse=True)
+        return names
+    except Exception as e:
+        print(f"Azure Blob list failed: {e}")
+        return []
+
+
+def _ensure_local_copy(filename: str) -> Optional[Path]:
+    """Return a local Path to the thermal frame, downloading from Blob if needed.
+
+    Returns None when the file is not found locally or in Blob.
+    """
+    local_path = DATA_DIR / filename
+    if local_path.exists():
+        return local_path
+    container = _get_blob_container()
+    if container is None:
+        return None
+    try:
+        blob_client = container.get_blob_client(f"thermal/{filename}")
+        data = blob_client.download_blob().readall()
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(data)
+            return local_path
+        except Exception:
+            import tempfile
+            tmp = Path(tempfile.mktemp(suffix=Path(filename).suffix))
+            tmp.write_bytes(data)
+            return tmp
+    except Exception:
+        return None
+
+
 def _safe_int(value: Optional[int], default: int, min_value: int, max_value: int) -> int:
     try:
         v = int(value) if value is not None else int(default)
@@ -845,49 +939,75 @@ def get_thermal_history(
     include_data: bool = Query(default=False, description="If true, include full frame payload; else metadata only"),
 ) -> dict:
     """
-    Return locally stored thermal frames (all sensors by default).
-    Uses the saved thermal frame files under THERMAL_DATA_DIR, including legacy
-    .json and compressed .json.gz files.
+    Return stored thermal frames (all sensors by default).
+    Sources: local THERMAL_DATA_DIR files first, then Azure Blob Storage when configured.
+    Blob-only entries return metadata derived from the filename; full pixel data is
+    downloaded on demand when include_data=true.
     """
     limit_i = _safe_int(limit, 100, 1, 500)
     offset_i = _safe_int(offset, 0, 0, 1_000_000_000)
     # Fetch one extra row so has_more is false when the page is full but no next page exists.
     fetch_limit = limit_i + 1
 
-    matches: List[dict] = []
-    seen = 0
-    for p in _iter_thermal_files():
-        try:
-            payload = _read_json_payload(p)
-        except Exception:
-            continue
+    # Build a unified candidate list: local files first, then Blob-only entries.
+    # Each candidate is either a Path (local) or a str filename (Blob-only).
+    local_files = _iter_thermal_files()
+    local_names = {p.name for p in local_files}
 
-        sid = payload.get("sensor_id")
-        ts = payload.get("timestamp")
-        fmt = payload.get("format")
+    candidates: List[Any] = list(local_files)
+    for blob_name in _list_blob_thermal_names(sensor_id_filter=sensor_id, date_filter=date):
+        if blob_name not in local_names:
+            candidates.append(blob_name)  # str = Blob-only
 
+    def _build_entry(source: Any) -> Optional[dict]:
+        """Build a history entry dict from a local Path or a Blob filename string."""
+        is_blob_only = isinstance(source, str)
+        filename = source if is_blob_only else source.name
+
+        if is_blob_only:
+            # Derive metadata from filename without downloading.
+            blob_safe_id, ts_iso = _parse_thermal_blob_meta(filename)
+            sid = blob_safe_id or None
+            ts = ts_iso or None
+            fmt = "compact"
+        else:
+            try:
+                payload = _read_json_payload(source)
+            except Exception:
+                return None
+            sid = payload.get("sensor_id")
+            ts = payload.get("timestamp")
+            fmt = payload.get("format")
+
+        # Apply filters (redundant for Blob entries pre-filtered by _list_blob_thermal_names,
+        # but required for local entries).
         if sensor_id is not None and str(sid) != str(sensor_id):
-            continue
+            return None
         if date:
-            # timestamp is ISO; YYYY-MM-DD... compare by prefix after stripping dashes
             try:
                 ymd = str(ts)[:10].replace("-", "")
             except Exception:
                 ymd = ""
             if ymd != date:
-                continue
-
-        if seen < offset_i:
-            seen += 1
-            continue
+                return None
 
         entry: dict = {
-            "file": p.name,
+            "file": filename,
             "timestamp": ts,
             "sensor_id": sid,
             "format": fmt,
         }
+
         if include_data:
+            # For Blob-only entries we need to download first.
+            if is_blob_only:
+                local_path = _ensure_local_copy(filename)
+                if local_path is None:
+                    return entry  # return metadata-only if download fails
+                try:
+                    payload = _read_json_payload(local_path)
+                except Exception:
+                    return entry
             payload_data = payload.get("data")
             source_format = fmt
             returned_format = fmt
@@ -905,6 +1025,18 @@ def get_thermal_history(
             entry["source_format"] = source_format
             entry["returned_format"] = returned_format
             entry["format"] = returned_format
+
+        return entry
+
+    matches: List[dict] = []
+    seen = 0
+    for candidate in candidates:
+        entry = _build_entry(candidate)
+        if entry is None:
+            continue
+        if seen < offset_i:
+            seen += 1
+            continue
         matches.append(entry)
         if len(matches) >= fetch_limit:
             break
@@ -1361,13 +1493,13 @@ def get_ml_labels_api() -> dict:
     return {"labels": labels_snap, "count": len(labels_snap)}
 
 
-@app.post("/api/ml/label")
 def _is_valid_thermal_filename(filename: str) -> bool:
     return filename.startswith("thermal_") and (
         filename.endswith("_compact.json") or filename.endswith("_compact.json.gz")
     )
 
 
+@app.post("/api/ml/label")
 def post_ml_label(req: _MLLabelRequest) -> dict:
     """Save or update a ground-truth label for a thermal frame file."""
     safe_file = Path(req.file).name
@@ -1375,8 +1507,18 @@ def post_ml_label(req: _MLLabelRequest) -> dict:
         raise HTTPException(status_code=400, detail="Invalid filename")
     if not _is_valid_thermal_filename(safe_file):
         raise HTTPException(status_code=400, detail="file must match thermal_*_compact.json(.gz)")
-    if not (DATA_DIR / safe_file).is_file():
-        raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
+    local_exists = (DATA_DIR / safe_file).is_file()
+    if not local_exists:
+        # Check Blob existence without downloading the full frame.
+        container = _get_blob_container()
+        blob_exists = False
+        if container is not None:
+            try:
+                blob_exists = container.get_blob_client(f"thermal/{safe_file}").exists()
+            except Exception:
+                pass
+        if not blob_exists:
+            raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
     if not 0 <= req.occupancy <= 20:
         raise HTTPException(status_code=400, detail="occupancy must be 0–20")
     label_entry = {
@@ -1395,8 +1537,8 @@ def post_ml_label(req: _MLLabelRequest) -> dict:
 def get_ml_infer(file: str = Query(..., description="Thermal frame filename")) -> dict:
     """Run heuristic and ML inference on a stored thermal frame and return both results."""
     safe_file = Path(file).name
-    local_path = DATA_DIR / safe_file
-    if not local_path.exists():
+    local_path = _ensure_local_copy(safe_file)
+    if local_path is None:
         raise HTTPException(status_code=404, detail=f"Frame not found: {safe_file}")
     try:
         payload = _read_json_payload(local_path)
