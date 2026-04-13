@@ -896,9 +896,11 @@ def _ensure_local_copy(filename: str) -> Optional[Path]:
             return local_path
         except Exception:
             import tempfile
-            tmp = Path(tempfile.mktemp(suffix=Path(filename).suffix))
-            tmp.write_bytes(data)
-            return tmp
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(filename).suffix, delete=False
+            ) as tf:
+                tf.write(data)
+                return Path(tf.name)
     except Exception:
         return None
 
@@ -1645,13 +1647,19 @@ def _run_training_thread() -> None:
         labels_snap = list(_ml_labels.values())
     log(f"Building features for {len(labels_snap)} labelled frames…")
     features, occ_targets, fever_targets = [], [], []
+    _tmp_paths: List[Path] = []  # temp files downloaded from Blob; cleaned up below
 
     for lbl in labels_snap:
         try:
-            path = DATA_DIR / lbl["file"]
-            if not path.exists():
+            # .name strips any path components from hand-edited label files;
+            # post_ml_label() already stores basenames, so this is defence-in-depth.
+            safe_file = Path(lbl["file"]).name
+            path = _ensure_local_copy(safe_file)
+            if path is None:
                 log(f"  Skipping missing file: {lbl['file']}")
                 continue
+            if path.parent != DATA_DIR:
+                _tmp_paths.append(path)  # track Blob-download temp files for cleanup
             payload = _read_json_payload(path)
             compact = payload.get("data") or payload
             arr = thermal_data_to_array(compact)
@@ -1661,6 +1669,12 @@ def _run_training_thread() -> None:
             fever_targets.append(1 if lbl.get("fever") else 0)
         except Exception as exc:
             log(f"  Warning: {lbl['file']}: {exc}")
+
+    for _p in _tmp_paths:
+        try:
+            _p.unlink()
+        except Exception:
+            pass
 
     n = len(features)
     if n < 10:

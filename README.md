@@ -256,7 +256,7 @@ Set in Container App environment or as `-e` flags when running Docker locally:
 | `PORT` | `8000` | Port to bind (Azure sets this automatically) |
 | `THERMAL_DATA_DIR` | `thermal_data` | Directory for thermal frames and occupancy logs; in the image: `/app/thermal_data` |
 | `AZURE_STORAGE_CONNECTION_STRING` | — | Enables Azure Blob Storage for durable frame and label storage |
-| `AZURE_STORAGE_CONTAINER_NAME` | `iotoccupancydata` | Blob container name |
+| `AZURE_STORAGE_CONTAINER_NAME` | `iotoccupancydata` | Blob container name (live deployment uses `sensor-data`) |
 | `SAVE_TO_BLOB` | `true` when connection string is set | Write data to Azure Blob |
 | `SAVE_LOCAL_DATA` | `false` when Blob is enabled | Write data to local disk. **Note:** the ML Studio (`/ml`) reads thermal frames from local disk via the history API; set this to `true` (and mount persistent storage) if you want ML Studio to work in a Blob-enabled deployment. |
 | `ML_MODEL_DIR` | `ml_models` | Local directory where ONNX models are cached |

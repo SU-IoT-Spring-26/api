@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ml.features import extract  # noqa: E402
 
 SAVE_SKLEARN_PICKLE = False  # set True to also save .pkl alongside .onnx
+_MAX_UNMATCHED_WARNINGS = 10  # cap noisy per-frame warnings in load_dataset()
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +71,9 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
         print(f"No compact thermal files found in {data_dir}")
         return features, occ_labels, fever_labels
 
-    # Load occupancy log index (date → {timestamp → occupancy})
-    occ_index: dict[str, tuple[int, int]] = {}  # ts_prefix → (occupancy, fever)
+    # Load occupancy log index: (sensor_id, ts_prefix) → (occupancy, fever)
+    # Keyed by sensor so frames from sensor A don't get labels from sensor B.
+    occ_index: dict[tuple[str, str], tuple[int, int]] = {}
     for occ_file in sorted(data_dir.glob("occupancy_*.jsonl*")):
         opener = gzip.open if occ_file.suffix == ".gz" else open
         try:
@@ -83,18 +85,29 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
                     entry = json.loads(line)
                     ts = entry.get("timestamp") or entry.get("ts")
                     occ = entry.get("occupancy")
+                    sensor = entry.get("sensor_id", "")
                     fever = 1 if entry.get("any_fever") else 0
-                    if ts and occ is not None:
-                        occ_index[str(ts)[:19]] = (int(occ), int(fever))
+                    if ts and occ is not None and sensor:
+                        occ_index[(sensor, str(ts)[:19])] = (int(occ), int(fever))
         except Exception as exc:
             print(f"Warning: could not read {occ_file}: {exc}")
 
     loaded = 0
+    matched_count = 0
+    unmatched_warnings = 0
     for path in compact_files:
         try:
             opener = gzip.open if path.name.endswith(".gz") else open
             with opener(path, "rt") as f:
                 frame = json.load(f)
+
+            # Unwrap the {"timestamp":..., "sensor_id":..., "data":{...}} envelope
+            # written by main.py's save_thermal_data().
+            envelope_sensor = frame.get("sensor_id", "")
+            if "data" in frame:
+                frame = frame["data"]
+
+            sensor_id = frame.get("sensor_id") or envelope_sensor
 
             # Extract temperature array
             temps_raw = frame.get("t") or frame.get("temperatures") or frame.get("pixels")
@@ -107,38 +120,47 @@ def load_dataset(data_dir: Path) -> tuple[list[np.ndarray], list[int], list[int]
             if isinstance(temps_raw[0], int):
                 min_t = frame.get("min", 0)
                 max_t = frame.get("max", 50)
-                n = len(temps_raw)
                 temps = [min_t + (max_t - min_t) * v / 255.0 for v in temps_raw]
             else:
                 temps = temps_raw
 
             arr = np.array(temps, dtype=np.float32).reshape(h, w)
 
-            # Match to occupancy log by timestamp in filename
-            # filename: thermal_<sensor>_<YYYYMMDD_HHMMSS>_compact.json(.gz)
+            # Match to occupancy log by sensor_id + timestamp in filename.
+            # filename: thermal_<sensor>_<YYYYMMDD>_<HHMMSS>_<ms>_compact.json(.gz)
             ts_str = None
             parts = path.stem.replace(".json", "").split("_")
-            # look for date+time pattern YYYYMMDD_HHMMSS
             for i, p in enumerate(parts):
                 if len(p) == 8 and p.isdigit() and i + 1 < len(parts) and len(parts[i + 1]) == 6:
                     ts_str = f"{p[:4]}-{p[4:6]}-{p[6:]}T{parts[i+1][:2]}:{parts[i+1][2:4]}:{parts[i+1][4:]}"
                     break
 
             occ, fever = (0, 0)
-            if ts_str:
-                match = occ_index.get(ts_str[:19])
+            matched = False
+            if ts_str and sensor_id:
+                match = occ_index.get((sensor_id, ts_str[:19]))
                 if match:
                     occ, fever = match
+                    matched = True
 
             feat = extract(arr)
             features.append(feat)
             occ_labels.append(occ)
             fever_labels.append(fever)
             loaded += 1
+            if matched:
+                matched_count += 1
+            else:
+                unmatched_warnings += 1
+                if unmatched_warnings <= _MAX_UNMATCHED_WARNINGS:
+                    print(f"  Warning: no occupancy log match for {path.name} (sensor={sensor_id!r}, ts={ts_str})")
         except Exception as exc:
             print(f"Warning: skipping {path.name}: {exc}")
 
-    print(f"Loaded {loaded} frames from {data_dir}")
+    unmatched = loaded - matched_count
+    if unmatched_warnings > _MAX_UNMATCHED_WARNINGS:
+        print(f"  ... and {unmatched_warnings - _MAX_UNMATCHED_WARNINGS} more unmatched frame(s) (suppressed)")
+    print(f"Loaded {loaded} frames from {data_dir} ({matched_count} matched occupancy log, {unmatched} defaulted to occupancy=0)")
     return features, occ_labels, fever_labels
 
 
@@ -167,6 +189,16 @@ def train_and_export(
         print(f"Only {len(X)} samples — need at least 20 for meaningful training. Aborting.")
         sys.exit(1)
 
+    n_occ_classes = len(set(occ_labels))
+    if n_occ_classes < 2:
+        print(
+            f"Occupancy labels contain only {n_occ_classes} distinct value(s): {set(occ_labels)}.\n"
+            "This usually means no thermal frames matched the occupancy logs (sensor ID or\n"
+            "timestamp mismatch). Check the warnings above and ensure you have occupancy_*.jsonl\n"
+            "files covering the same sensor and dates as your thermal frames."
+        )
+        sys.exit(1)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Occupancy model ---
@@ -176,11 +208,14 @@ def train_and_export(
     from collections import Counter as _Counter
     min_occ_class = min(_Counter(y_occ).values())
     cv_occ = min(5, len(X) // 5, min_occ_class)
-    try:
-        scores = cross_val_score(occ_clf, X, y_occ, cv=cv_occ, scoring="accuracy")
-        print(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
-    except ValueError as e:
-        print(f"  CV skipped ({e})")
+    if cv_occ < 2:
+        print(f"  CV skipped (need ≥2 samples per class; smallest class has {min_occ_class})")
+    else:
+        try:
+            scores = cross_val_score(occ_clf, X, y_occ, cv=cv_occ, scoring="accuracy")
+            print(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
+        except ValueError as e:
+            print(f"  CV skipped ({e})")
     occ_clf.fit(X, y_occ)
     _export_onnx(occ_clf, X.shape[1], out_dir / "occupancy_model.onnx", "occupancy_model")
     if SAVE_SKLEARN_PICKLE:
@@ -197,11 +232,14 @@ def train_and_export(
     else:
         fever_clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
         cv_fever = min(5, len(X) // 5, fever_pos, len(y_fever) - fever_pos)
-        try:
-            scores = cross_val_score(fever_clf, X, y_fever, cv=cv_fever, scoring="f1")
-            print(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
-        except ValueError as e:
-            print(f"  CV skipped ({e})")
+        if cv_fever < 2:
+            print(f"  CV skipped (need ≥2 samples in each class for CV)")
+        else:
+            try:
+                scores = cross_val_score(fever_clf, X, y_fever, cv=cv_fever, scoring="f1")
+                print(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
+            except ValueError as e:
+                print(f"  CV skipped ({e})")
         fever_clf.fit(X, y_fever)
         _export_onnx(fever_clf, X.shape[1], out_dir / "fever_model.onnx", "fever_model")
         if SAVE_SKLEARN_PICKLE:
