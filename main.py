@@ -11,7 +11,7 @@ import gzip
 import threading
 from collections import Counter, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,6 +59,12 @@ def _get_blob_container():
     except Exception as e:
         print(f"Azure Blob Storage init failed (blob uploads disabled): {e}")
         _blob_container_client = False
+        # If local storage was suppressed because blob was configured, re-enable it as fallback
+        # so sensor uploads are not silently dropped.
+        global SAVE_LOCAL_DATA
+        if not SAVE_LOCAL_DATA:
+            print("WARNING: Blob storage unavailable and local storage was disabled — enabling local storage as fallback.")
+            SAVE_LOCAL_DATA = True
         return None
 
 
@@ -660,8 +666,8 @@ def _get_sql_connection():
         _sql_connection = conn
         return _sql_connection
     except Exception as e:
-        print(f"Azure SQL connection failed ({type(e).__name__}); SQL saving disabled.")
-        _sql_connection = False
+        print(f"Azure SQL connection failed ({type(e).__name__}); will retry on next upload: {e}")
+        _sql_connection = None
         return None
 
 
@@ -736,7 +742,7 @@ def save_thermal_data(compact_data: dict, sensor_id: Optional[str] = None) -> No
     sid = sensor_id or compact_data.get("sensor_id") or "unknown"
     safe_id = _sanitize_sensor_id_for_filename(sid)
     try:
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
         ts = timestamp.strftime("%Y%m%d_%H%M%S_%f")[:-3]
         payload = {
             "timestamp": timestamp.isoformat(),
@@ -754,14 +760,14 @@ def save_thermal_data(compact_data: dict, sensor_id: Optional[str] = None) -> No
             _upload_blob(f"thermal/{path.name}", compressed_bytes, content_type="application/gzip")
         _data_counter += 1
     except Exception as e:
-        print(f"Error saving thermal data: {e}")
+        print(f"Error saving thermal data (sensor={sid}): {e}")
 
 
 def save_occupancy_data(occupancy_result: dict) -> None:
     if not SAVE_LOCAL_DATA and not SAVE_TO_BLOB:
         return
     try:
-        timestamp = datetime.now()
+        timestamp = datetime.now(timezone.utc)
         date_str = timestamp.strftime("%Y%m%d")
         path = DATA_DIR / f"occupancy_{date_str}.jsonl"
         sid = occupancy_result.get("sensor_id") or "unknown"
@@ -795,7 +801,7 @@ def save_occupancy_data(occupancy_result: dict) -> None:
             # Azure Blob: append to daily append blob
             _append_to_blob(f"occupancy/occupancy_{date_str}.jsonl", line)
     except Exception as e:
-        print(f"Error saving occupancy data: {e}")
+        print(f"Error saving occupancy data (sensor={sid}): {e}")
 
 
 def _iter_thermal_files() -> List[Path]:
@@ -1143,10 +1149,10 @@ def receive_thermal_data(data: dict) -> dict:
             )
             if ml_result:
                 occupancy_result["ml"] = ml_result
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Signal processing error (sensor={sensor_id}): {e}")
     latest_occupancy = occupancy_result
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     last_update_time = now_iso
     # Per-sensor latest state
     latest_thermal_by_sensor[sensor_id] = dict(latest_thermal_data) if latest_thermal_data else {}
@@ -1934,7 +1940,7 @@ function renderFrame(data) {
     mlBadge +
     (data.ml_fever != null ? ' ' + (data.ml_fever ? badge('badge-fever', 'ML fever') : badge('badge-ok', 'ML no fever')) : '');
 
-  const ts = data.last_update ? new Date(data.last_update).toLocaleTimeString() : '—';
+  const ts = data.last_update ? new Date(data.last_update).toLocaleTimeString('en-US', { timeZone: 'America/New_York' }) + ' EST' : '—';
   statusEl.textContent = `Last update: ${ts}  ·  ${W}×${H} px`;
 }
 
@@ -2279,7 +2285,7 @@ function renderGrid(tab) {
 
     const ts = document.createElement('div');
     ts.style.cssText = 'font-size:0.6rem;color:#475569;padding:2px 3px;background:#0f1117;';
-    ts.textContent = (frame.timestamp || '').substring(11,19);
+    ts.textContent = frame.timestamp ? new Date(frame.timestamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour12: false }) : '';
     wrap.appendChild(ts);
 
     grid.appendChild(wrap);
@@ -2300,7 +2306,8 @@ function selectFrame(tab, frame) {
 
   const meta = document.createElement('div');
   meta.style.cssText = 'font-size:0.75rem;color:#64748b;';
-  meta.textContent = frame.sensor_id + '  ·  ' + (frame.timestamp || '').replace('T',' ').substring(0,19);
+  const fmtTs = frame.timestamp ? new Date(frame.timestamp).toLocaleString('en-US', { timeZone: 'America/New_York', hour12: false }) : '';
+  meta.textContent = frame.sensor_id + '  ·  ' + fmtTs;
 
   if (tab === 'label') {
     const occVal = existing ? existing.occupancy : 0;
