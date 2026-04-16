@@ -110,13 +110,10 @@ app = FastAPI(
 
 
 def _restore_state_from_disk() -> None:
-    """Reload the most recent thermal frame and occupancy result per sensor from disk after a restart."""
+    """Reload the most recent thermal frame and occupancy result per sensor from disk or Blob after a restart."""
     global latest_thermal_data, last_update_time, latest_occupancy
 
-    if not DATA_DIR.exists():
-        return
-
-    # --- Thermal frames: latest frame per sensor from stored compact/expanded files ---
+    # --- Thermal frames: latest frame per sensor from local files ---
     best_thermal: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, data)
     for p in _iter_thermal_files():
         try:
@@ -136,6 +133,33 @@ def _restore_state_from_disk() -> None:
         except Exception:
             continue
 
+    # Blob fallback for thermal: pull the newest frame per sensor not found locally.
+    seen_safe_ids = {_sanitize_sensor_id_for_filename(s) for s in best_thermal}
+    for filename in _list_blob_thermal_names():
+        safe_id, ts_iso = _parse_thermal_blob_meta(filename)
+        if not safe_id or safe_id in seen_safe_ids:
+            continue
+        seen_safe_ids.add(safe_id)
+        local_path = _ensure_local_copy(filename)
+        if local_path is None:
+            continue
+        try:
+            payload = _read_json_payload(local_path)
+            sid = payload.get("sensor_id") or (payload.get("data") or {}).get("sensor_id") or safe_id
+            if sid in best_thermal:
+                continue
+            ts = payload.get("timestamp", "") or ts_iso
+            data = payload.get("data") or {}
+            if payload.get("format") == "compact" and "t" in data:
+                expanded = expand_thermal_data(data)
+                expanded["sensor_id"] = sid
+                data = expanded
+            if not data.get("pixels"):
+                continue
+            best_thermal[sid] = (ts, data)
+        except Exception:
+            continue
+
     for sid, (ts, data) in best_thermal.items():
         latest_thermal_by_sensor[sid] = data
         last_update_time_by_sensor[sid] = ts
@@ -143,23 +167,57 @@ def _restore_state_from_disk() -> None:
             latest_thermal_data = data
             last_update_time = ts
 
-    # --- Occupancy: latest entry per sensor from daily jsonl files ---
+    # --- Occupancy: latest entry per sensor from local daily jsonl files ---
     best_occ: Dict[str, Tuple[str, dict]] = {}  # sensor_id -> (timestamp_str, entry)
-    for p in DATA_DIR.glob("occupancy_*.jsonl"):
-        try:
-            for line in p.read_text().splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                entry = json.loads(line)
-                sid = entry.get("sensor_id")
-                ts = entry.get("timestamp", "")
-                if not sid:
-                    continue
-                if sid not in best_occ or ts > best_occ[sid][0]:
-                    best_occ[sid] = (ts, entry)
-        except Exception:
-            continue
+    if DATA_DIR.exists():
+        for p in DATA_DIR.glob("occupancy_*.jsonl"):
+            try:
+                for line in p.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    sid = entry.get("sensor_id")
+                    ts = entry.get("timestamp", "")
+                    if not sid:
+                        continue
+                    if sid not in best_occ or ts > best_occ[sid][0]:
+                        best_occ[sid] = (ts, entry)
+            except Exception:
+                continue
+
+    # Blob fallback for occupancy: scan newest daily files until all thermal sensors are covered.
+    sensors_needing_occ = set(best_thermal) - set(best_occ)
+    if sensors_needing_occ:
+        container = _get_blob_container()
+        if container is not None:
+            try:
+                occ_blob_names = sorted(
+                    [b.name for b in container.list_blobs(name_starts_with="occupancy/")
+                     if b.name.endswith(".jsonl")],
+                    reverse=True,
+                )
+                for blob_name in occ_blob_names[:5]:  # scan at most 5 daily files
+                    if not sensors_needing_occ:
+                        break
+                    try:
+                        raw = container.get_blob_client(blob_name).download_blob().readall()
+                        for line in raw.decode("utf-8").splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            sid = entry.get("sensor_id")
+                            ts = entry.get("timestamp", "")
+                            if not sid or sid not in sensors_needing_occ:
+                                continue
+                            if sid not in best_occ or ts > best_occ[sid][0]:
+                                best_occ[sid] = (ts, entry)
+                        sensors_needing_occ -= set(best_occ)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Blob occupancy restore failed: {e}")
 
     for sid, (ts, entry) in best_occ.items():
         latest_occupancy_by_sensor[sid] = entry
@@ -170,7 +228,7 @@ def _restore_state_from_disk() -> None:
 
     if best_thermal or best_occ:
         sensors = set(best_thermal) | set(best_occ)
-        print(f"Restored state from disk for {len(sensors)} sensor(s): {sorted(sensors)}")
+        print(f"Restored state for {len(sensors)} sensor(s): {sorted(sensors)}")
 
     _load_ml_labels()  # called unconditionally — handles missing DATA_DIR gracefully
 
