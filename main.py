@@ -280,10 +280,10 @@ FEVER_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("FEVER_MIN_CONSECUTIVE_
 # Frames flagged as subpage-corrupted fall back to the previous valid frame (no rejection,
 # so occupancy is never dropped to 0 due to sensor read timing).
 SUBPAGE_ARTIFACT_ENABLED = os.environ.get("SUBPAGE_ARTIFACT_ENABLED", "true").lower() in ("1", "true", "yes")
-# Fraction of pixels where odd-row mean temp differs from even-row mean by more than threshold.
+# Minimum row-mean delta (°C) for a row-diff pair to be counted toward the checkerboard score.
 # A clean frame has near-zero even/odd asymmetry; a subpage frame shows alternating-row offsets.
 SUBPAGE_ROW_DIFF_THRESHOLD_C = float(os.environ.get("SUBPAGE_ROW_DIFF_THRESHOLD_C", "0.8"))
-# Minimum fraction of pixel pairs that must show the alternating sign pattern to flag as corrupted.
+# Minimum fraction of row-diff pairs that must show the alternating sign pattern to flag as corrupted.
 SUBPAGE_CHECKERBOARD_FRAC = float(os.environ.get("SUBPAGE_CHECKERBOARD_FRAC", "0.25"))
 
 # Temporal occupancy smoothing and frame sanity (no ground truth required)
@@ -508,17 +508,16 @@ def detect_subpage_artifact(temp_array: np.ndarray) -> Tuple[bool, float]:
     diffs = row_means[1:] - row_means[:-1]  # shape (h-1,)
 
     # Look for sign alternation in pairs: diff[i] and diff[i+1] should have opposite signs
-    n_pairs = 0
     n_alternating = 0
+    total_pairs = 0
     for i in range(0, len(diffs) - 1, 2):
         d0, d1 = diffs[i], diffs[i + 1]
+        total_pairs += 1
         if abs(d0) > SUBPAGE_ROW_DIFF_THRESHOLD_C and abs(d1) > SUBPAGE_ROW_DIFF_THRESHOLD_C:
-            n_pairs += 1
             if d0 * d1 < 0:  # opposite signs
                 n_alternating += 1
 
-    total_pairs = max(1, h // 2 - 1)
-    checkerboard_frac = n_alternating / total_pairs
+    checkerboard_frac = n_alternating / max(1, total_pairs)
     is_corrupted = checkerboard_frac >= SUBPAGE_CHECKERBOARD_FRAC
     return is_corrupted, checkerboard_frac
 
@@ -640,10 +639,12 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
         subpage_frac = 0.0
         if sensor_id is not None:
             subpage_corrupted, subpage_frac = detect_subpage_artifact(temp_array_2d)
-            if subpage_corrupted and sensor_id in _last_clean_frame_by_sensor:
-                temp_array_2d = interpolate_subpages(
-                    temp_array_2d, _last_clean_frame_by_sensor[sensor_id]
-                )
+            cached_clean_frame = _last_clean_frame_by_sensor.get(sensor_id)
+            if subpage_corrupted and cached_clean_frame is not None:
+                if cached_clean_frame.shape == temp_array_2d.shape:
+                    temp_array_2d = interpolate_subpages(temp_array_2d, cached_clean_frame)
+                else:
+                    _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
             if not subpage_corrupted:
                 _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
 

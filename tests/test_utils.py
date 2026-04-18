@@ -677,7 +677,7 @@ class TestEstimateOccupancySubpageFields:
 
     def _minimal_payload(self) -> dict:
         flat = [25.0] * 768
-        return {"t": flat}
+        return {"w": 32, "h": 24, "t": flat}
 
     def test_subpage_fields_present_on_success(self):
         result = estimate_occupancy(self._minimal_payload(), sensor_id="cam1")
