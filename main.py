@@ -5,11 +5,12 @@ Designed for Azure App Service (resource group: occupancy-rg, app: occupancy-api
 Stores data locally and optionally to Azure Blob Storage when configured.
 """
 
+import bisect
 import json
 import os
 import gzip
 import threading
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -586,8 +587,8 @@ def _load_ground_truth() -> None:
                 raw = container.get_blob_client("occupancy/ground_truth.jsonl").download_blob().readall()
                 for line in raw.decode("utf-8").splitlines():
                     _ingest(line)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Could not load ground truth from Blob: {e}")
 
     _ground_truth = loaded
     if loaded:
@@ -2071,8 +2072,10 @@ def _compute_accuracy_metrics(
     error statistics. Only ground truth entries matching ``sensor_id`` (when set)
     and inside the optional date range are included.
     """
+    with _ground_truth_lock:
+        all_gt = list(_ground_truth.values())
     gt_entries = [
-        e for e in _ground_truth.values()
+        e for e in all_gt
         if (sensor_id is None or e.get("sensor_id") == sensor_id)
     ]
     if since or until:
@@ -2096,6 +2099,18 @@ def _compute_accuracy_metrics(
 
     history = _load_occupancy_history_for_accuracy(sensor_id, since, until)
 
+    # Index history by sensor_id with sorted _dt lists for O(n log m) window lookups.
+    history_by_sensor: Dict[str, List[dict]] = defaultdict(list)
+    for h in history:
+        history_by_sensor[h.get("sensor_id", "")].append(h)
+    for entries_for_sensor in history_by_sensor.values():
+        entries_for_sensor.sort(key=lambda x: x["_dt"])
+    # Pre-extract sorted timestamps per sensor for bisect operations.
+    sensor_timestamps: Dict[str, List[datetime]] = {
+        sid: [h["_dt"] for h in entries_for_sensor]
+        for sid, entries_for_sensor in history_by_sensor.items()
+    }
+
     # --- Occupancy regression metrics ---
     sq_errors: List[float] = []
     abs_errors: List[float] = []
@@ -2117,17 +2132,31 @@ def _compute_accuracy_metrics(
             unmatched += 1
             continue
         gt_sid = e.get("sensor_id", "")
-        candidates = [
-            h for h in history
-            if h.get("sensor_id") == gt_sid
-            and abs((h["_dt"] - gt_dt).total_seconds()) <= window_seconds
-        ]
+        sensor_hist = history_by_sensor.get(gt_sid, [])
+        if sensor_hist:
+            window_delta = timedelta(seconds=window_seconds)
+            ts_list = sensor_timestamps[gt_sid]
+            lo = bisect.bisect_left(ts_list, gt_dt - window_delta)
+            hi = bisect.bisect_right(ts_list, gt_dt + window_delta)
+            candidates = sensor_hist[lo:hi]
+        else:
+            candidates = []
         if not candidates:
             unmatched += 1
             continue
 
+        valid_occupancies: List[int] = []
+        for h in candidates:
+            try:
+                valid_occupancies.append(int(h.get("occupancy", 0)))
+            except (TypeError, ValueError):
+                continue
+        if not valid_occupancies:
+            unmatched += 1
+            continue
+
         actual = int(e["actual_occupancy"])
-        est_avg = sum(int(h.get("occupancy", 0)) for h in candidates) / len(candidates)
+        est_avg = sum(valid_occupancies) / len(valid_occupancies)
         est = int(round(est_avg))
 
         err = est - actual
@@ -2227,6 +2256,17 @@ def _compute_accuracy_metrics(
     return result
 
 
+def _normalize_gt_timestamp(ts: str) -> str:
+    """Parse an ISO 8601 timestamp string and return a UTC-normalised isoformat string.
+
+    Raises ``ValueError`` for unparseable inputs so callers can return HTTP 400.
+    """
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
 def _require_gt_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     """Reject requests when GROUND_TRUTH_API_KEY is set and the header doesn't match."""
     if GROUND_TRUTH_API_KEY and x_api_key != GROUND_TRUTH_API_KEY:
@@ -2241,7 +2281,7 @@ def post_ground_truth(entry: _GroundTruthEntry) -> dict:
     Used to populate accuracy metrics via GET /api/occupancy/accuracy.
     """
     try:
-        datetime.fromisoformat(entry.timestamp.replace("Z", "+00:00"))
+        ts_norm = _normalize_gt_timestamp(entry.timestamp)
     except Exception:
         raise HTTPException(status_code=400, detail="timestamp must be a valid ISO 8601 string")
     if not 0 <= entry.actual_occupancy <= 50:
@@ -2249,9 +2289,9 @@ def post_ground_truth(entry: _GroundTruthEntry) -> dict:
     sid = entry.sensor_id.strip()
     if not sid:
         raise HTTPException(status_code=400, detail="sensor_id must not be empty or whitespace")
-    key = f"{entry.timestamp}|{sid}"
+    key = f"{ts_norm}|{sid}"
     record = {
-        "timestamp": entry.timestamp,
+        "timestamp": ts_norm,
         "sensor_id": sid,
         "actual_occupancy": entry.actual_occupancy,
         "actual_fever": entry.actual_fever,
@@ -2270,7 +2310,11 @@ def delete_ground_truth(
 ) -> dict:
     """Remove a single ground truth entry by (timestamp, sensor_id)."""
     sid = sensor_id.strip()
-    key = f"{timestamp}|{sid}"
+    try:
+        ts_norm = _normalize_gt_timestamp(timestamp)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="timestamp must be a valid ISO 8601 string")
+    key = f"{ts_norm}|{sid}"
     with _ground_truth_lock:
         if key not in _ground_truth:
             raise HTTPException(status_code=404, detail=f"No ground truth entry found for key: {key}")
