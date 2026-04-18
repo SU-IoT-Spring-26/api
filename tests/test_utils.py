@@ -715,4 +715,4 @@ class TestRunTrainingThreadWrapper:
         monkeypatch.setattr(main, "_run_training_thread", lambda: (_ for _ in ()).throw(ValueError("secret path")))
         _run_training_thread_wrapper()
         for entry in main._ml_training_status.get("log", []):
-            assert "secret path" not in entry or entry == ""
+            assert "secret path" not in entry
