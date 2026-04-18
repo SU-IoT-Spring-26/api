@@ -4,6 +4,7 @@ import pytest
 
 import main
 from main import (
+    _load_ml_labels,
     _parse_temperature,
     _run_training_thread_wrapper,
     _sanitize_sensor_id_for_filename,
@@ -716,3 +717,71 @@ class TestRunTrainingThreadWrapper:
         _run_training_thread_wrapper()
         for entry in main._ml_training_status.get("log", []):
             assert "secret path" not in entry
+
+
+# ---------------------------------------------------------------------------
+# _load_ml_labels — Blob fallback
+# ---------------------------------------------------------------------------
+
+class TestLoadMlLabelsBlob:
+    """_load_ml_labels must restore labels from Blob when local file absent."""
+
+    def _make_blob_container(self, content: str):
+        """Return a minimal mock blob container whose get_blob_client returns content."""
+        class _BlobData:
+            def __init__(self, raw):
+                self._raw = raw
+            def readall(self):
+                return self._raw.encode("utf-8")
+
+        class _BlobClient:
+            def __init__(self, raw):
+                self._raw = raw
+            def download_blob(self):
+                return _BlobData(self._raw)
+
+        class _Container:
+            def __init__(self, raw):
+                self._raw = raw
+            def get_blob_client(self, name):
+                return _BlobClient(self._raw)
+
+        return _Container(content)
+
+    def test_blob_fallback_populates_labels(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(main, "_ml_labels", {})
+        label_line = '{"file":"frame_001.json","occupancy":1,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        container = self._make_blob_container(label_line + "\n")
+        monkeypatch.setattr(main, "_get_blob_container", lambda: container)
+        _load_ml_labels()
+        assert "frame_001.json" in main._ml_labels
+        assert main._ml_labels["frame_001.json"]["occupancy"] == 1
+
+    def test_blob_fallback_writes_cache_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(main, "_ml_labels", {})
+        label_line = '{"file":"frame_002.json","occupancy":0,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        container = self._make_blob_container(label_line + "\n")
+        monkeypatch.setattr(main, "_get_blob_container", lambda: container)
+        _load_ml_labels()
+        assert (tmp_path / "ml_labels.jsonl").exists()
+
+    def test_local_file_takes_priority_over_blob(self, monkeypatch, tmp_path):
+        label_line = '{"file":"local.json","occupancy":2,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        (tmp_path / "ml_labels.jsonl").write_text(label_line + "\n")
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(main, "_ml_labels", {})
+        blob_line = '{"file":"blob.json","occupancy":0,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        container = self._make_blob_container(blob_line + "\n")
+        monkeypatch.setattr(main, "_get_blob_container", lambda: container)
+        _load_ml_labels()
+        assert "local.json" in main._ml_labels
+        assert "blob.json" not in main._ml_labels
+
+    def test_no_blob_configured_leaves_labels_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(main, "_ml_labels", {})
+        monkeypatch.setattr(main, "_get_blob_container", lambda: None)
+        _load_ml_labels()
+        assert main._ml_labels == {}

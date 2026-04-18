@@ -382,35 +382,35 @@ def _load_ml_labels() -> None:
 
     On a fresh container the local file won't exist, so we fall back to
     downloading ml/labels.jsonl from Azure Blob Storage when configured.
+    The downloaded content is always written to DATA_DIR so subsequent
+    reads within the same container lifetime stay local.
     """
     global _ml_labels
     path = DATA_DIR / "ml_labels.jsonl"
-    raw: Optional[str] = None
+    loaded: Dict[str, dict] = {}
 
     if path.exists():
         try:
-            raw = path.read_text()
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        if "file" in entry:
+                            loaded[entry["file"]] = entry
+            _ml_labels = loaded
+            print(f"Loaded {len(_ml_labels)} ML label(s)")
+            return
         except Exception as e:
             print(f"Could not read ML labels from disk: {e}")
 
-    if raw is None:
-        container = _get_blob_container()
-        if container is not None:
-            try:
-                blob_client = container.get_blob_client("ml/labels.jsonl")
-                raw = blob_client.download_blob().readall().decode("utf-8")
-                print("Restored ML labels from Azure Blob Storage")
-                if SAVE_LOCAL_DATA:
-                    DATA_DIR.mkdir(parents=True, exist_ok=True)
-                    path.write_text(raw)
-            except Exception as e:
-                print(f"Could not restore ML labels from Blob: {e}")
-
-    if raw is None:
+    container = _get_blob_container()
+    if container is None:
         return
-
-    loaded: Dict[str, dict] = {}
     try:
+        blob_client = container.get_blob_client("ml/labels.jsonl")
+        raw = blob_client.download_blob().readall().decode("utf-8")
+        print("Restored ML labels from Azure Blob Storage")
         for line in raw.splitlines():
             line = line.strip()
             if line:
@@ -419,8 +419,13 @@ def _load_ml_labels() -> None:
                     loaded[entry["file"]] = entry
         _ml_labels = loaded
         print(f"Loaded {len(_ml_labels)} ML label(s)")
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw)
+        except Exception as e:
+            print(f"Could not cache ML labels locally: {e}")
     except Exception as e:
-        print(f"Could not parse ML labels: {e}")
+        print(f"Could not restore ML labels from Blob: {e}")
 
 
 def _persist_ml_labels() -> None:
