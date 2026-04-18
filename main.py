@@ -231,6 +231,7 @@ def _restore_state_from_disk() -> None:
         print(f"Restored state for {len(sensors)} sensor(s): {sorted(sensors)}")
 
     _load_ml_labels()  # called unconditionally — handles missing DATA_DIR gracefully
+    _load_sensor_metadata()
 
 
 app.add_middleware(
@@ -264,6 +265,12 @@ if "SAVE_THERMAL_DATA" in os.environ and _save_local_data_raw is None:
 SAVE_DATA = SAVE_LOCAL_DATA
 SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
 SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
+
+# Webhook alert: POST to this URL on fever detection (rising edge) or room overcapacity.
+# Leave empty to disable. Fires in a background thread so it never delays the API response.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+# Fraction of capacity that triggers an overcapacity alert (default 1.0 = at or above capacity).
+ALERT_OVERCAPACITY_PCT = float(os.environ.get("ALERT_OVERCAPACITY_PCT", "1.0"))
 
 # Occupancy detection parameters
 MIN_HUMAN_TEMP = 30.0
@@ -310,6 +317,14 @@ if SAVE_LOCAL_DATA:
 _ml_labels: Dict[str, dict] = {}  # filename → {file, occupancy, fever, ts}
 _ml_training_status: dict = {"state": "idle", "message": "", "ts": None, "log": []}
 _ml_training_lock = threading.Lock()
+
+# Per-sensor room metadata (room_name, capacity, building).
+_sensor_metadata: Dict[str, dict] = {}  # sensor_id → {room_name, capacity, building, ts_updated}
+_sensor_metadata_lock = threading.Lock()
+
+# Previous alert state per sensor — used to detect fever/overcapacity rising edges.
+_last_alert_state_by_sensor: Dict[str, dict] = {}  # sensor_id → {fever: bool, overcapacity: bool}
+_alert_state_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
@@ -366,6 +381,137 @@ def _persist_ml_labels() -> None:
             _upload_blob("ml/labels.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
         except Exception as e:
             print(f"Error uploading ML labels to Blob: {e}")
+
+
+def _load_sensor_metadata() -> None:
+    """Load persisted sensor metadata (room_name, capacity, building) from disk or Blob."""
+    global _sensor_metadata
+    raw: Optional[bytes] = None
+    if DATA_DIR.exists():
+        path = DATA_DIR / "sensor_metadata.json"
+        if path.exists():
+            try:
+                raw = path.read_bytes()
+            except Exception as e:
+                print(f"Could not read sensor_metadata.json: {e}")
+    if raw is None:
+        container = _get_blob_container()
+        if container is not None:
+            try:
+                raw = container.get_blob_client("sensor_metadata.json").download_blob().readall()
+            except Exception:
+                pass
+    if raw:
+        try:
+            loaded = json.loads(raw.decode("utf-8"))
+            if isinstance(loaded, dict):
+                normalized: Dict[str, dict] = {}
+                for sid, entry in loaded.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    clean: dict = {}
+                    for field in ("room_name", "building", "ts_updated"):
+                        if field in entry:
+                            clean[field] = entry[field]
+                    if "capacity" in entry:
+                        try:
+                            clean["capacity"] = int(entry["capacity"])
+                        except (TypeError, ValueError):
+                            pass  # drop unparseable capacity
+                    normalized[sid] = clean
+                with _sensor_metadata_lock:
+                    _sensor_metadata.clear()
+                    _sensor_metadata.update(normalized)
+                print(f"Loaded metadata for {len(normalized)} sensor(s)")
+        except Exception as e:
+            print(f"Could not parse sensor_metadata.json: {e}")
+
+
+def _persist_sensor_metadata() -> None:
+    """Write sensor metadata to disk and Blob."""
+    with _sensor_metadata_lock:
+        snapshot = dict(_sensor_metadata)
+    content = json.dumps(snapshot, indent=2).encode("utf-8")
+    if SAVE_LOCAL_DATA:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            (DATA_DIR / "sensor_metadata.json").write_bytes(content)
+        except Exception as e:
+            print(f"Error saving sensor_metadata.json: {e}")
+    if SAVE_TO_BLOB:
+        try:
+            _upload_blob("sensor_metadata.json", content, content_type="application/json")
+        except Exception as e:
+            print(f"Error uploading sensor_metadata.json: {e}")
+
+
+def _fire_webhook(payload: dict) -> None:
+    """POST alert payload to ALERT_WEBHOOK_URL. Called in a daemon thread."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    import urllib.request  # noqa: PLC0415
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ALERT_WEBHOOK_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"[Alert] webhook OK ({resp.status}): {payload.get('alert_type')} for {payload.get('sensor_id')}")
+    except Exception as e:
+        print(f"[Alert] webhook failed: {e}")
+
+
+def _maybe_fire_alerts(sensor_id: str, occupancy_result: dict, now_iso: str) -> None:
+    """Detect rising edges on fever and overcapacity; fire webhook once per transition."""
+    if not ALERT_WEBHOOK_URL:
+        return
+
+    curr_fever = bool(occupancy_result.get("any_fever", False))
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
+    capacity = meta.get("capacity")
+    occ = int(occupancy_result.get("occupancy", 0))
+    curr_overcapacity = (
+        capacity is not None and capacity > 0 and occ / capacity >= ALERT_OVERCAPACITY_PCT
+    )
+
+    with _alert_state_lock:
+        prev = _last_alert_state_by_sensor.get(sensor_id, {"fever": False, "overcapacity": False})
+        new_fever = curr_fever and not prev["fever"]
+        new_overcapacity = curr_overcapacity and not prev["overcapacity"]
+        _last_alert_state_by_sensor[sensor_id] = {"fever": curr_fever, "overcapacity": curr_overcapacity}
+
+    alerts = []
+    if new_fever:
+        alerts.append({
+            "alert_type": "fever",
+            "sensor_id": sensor_id,
+            "room_name": meta.get("room_name"),
+            "building": meta.get("building"),
+            "timestamp": now_iso,
+            "occupancy": occ,
+            "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "effective_fever_threshold": occupancy_result.get("effective_fever_threshold"),
+            "message": "Fever detected — room may require disinfection.",
+        })
+    if new_overcapacity:
+        alerts.append({
+            "alert_type": "overcapacity",
+            "sensor_id": sensor_id,
+            "room_name": meta.get("room_name"),
+            "building": meta.get("building"),
+            "timestamp": now_iso,
+            "occupancy": occ,
+            "capacity": capacity,
+            "occupancy_pct": round(occ / capacity, 3),
+            "message": f"Room at or above capacity ({occ}/{capacity}).",
+        })
+
+    for alert in alerts:
+        threading.Thread(target=_fire_webhook, args=(alert,), daemon=True).start()
 
 
 def _load_thermal_background(sensor_id: str) -> None:
@@ -979,12 +1125,9 @@ def _safe_int(value: Optional[int], default: int, min_value: int, max_value: int
 
 @app.get("/api/sensors")
 def list_sensors() -> dict:
-    """List known sensor IDs (from memory + stored files)."""
+    """List known sensor IDs with any stored room metadata."""
     sensors = set(latest_thermal_by_sensor.keys()) | set(latest_occupancy_by_sensor.keys())
-    # Add sensors found on disk
     for p in _iter_thermal_files():
-        # Filename: thermal_<safe_id>_<ts>_<suffix>.json(.gz) ; safe_id may differ from original.
-        # Prefer payload sensor_id for correctness.
         try:
             payload = _read_json_payload(p)
             sid = payload.get("sensor_id")
@@ -993,7 +1136,40 @@ def list_sensors() -> dict:
         except Exception:
             continue
     out = sorted(sensors)
-    return {"count": len(out), "sensors": out}
+    return {
+        "count": len(out),
+        "sensors": out,
+        "metadata": {sid: _sensor_metadata.get(sid, {}) for sid in out},
+    }
+
+
+class _SensorMetadataUpdate(BaseModel):
+    room_name: Optional[str] = None
+    capacity: Optional[int] = None
+    building: Optional[str] = None
+
+
+@app.patch("/api/sensors/{sensor_id}")
+def update_sensor_metadata(sensor_id: str, update: _SensorMetadataUpdate) -> dict:
+    """Set room name, capacity, and/or building for a sensor.
+
+    Only supplied fields are updated; omitted fields are left unchanged.
+    Capacity is used for occupancy percentage reporting and overcapacity alerts.
+    """
+    if update.capacity is not None and update.capacity < 0:
+        raise HTTPException(status_code=400, detail="capacity must be >= 0")
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
+        if update.room_name is not None:
+            meta["room_name"] = update.room_name
+        if update.capacity is not None:
+            meta["capacity"] = update.capacity
+        if update.building is not None:
+            meta["building"] = update.building
+        meta["ts_updated"] = datetime.now(timezone.utc).isoformat()
+        _sensor_metadata[sensor_id] = meta
+    _persist_sensor_metadata()
+    return {"sensor_id": sensor_id, "metadata": meta}
 
 
 @app.get("/api/thermal/history")
@@ -1219,6 +1395,7 @@ def receive_thermal_data(data: dict) -> dict:
     save_thermal_data(compact_data, sensor_id)
     save_occupancy_data(occupancy_result)
     save_occupancy_data_sql(occupancy_result, timestamp_iso=now_iso)
+    _maybe_fire_alerts(sensor_id, occupancy_result, now_iso)
     pixel_count = len(latest_thermal_data.get("pixels", []))
     return {
         "status": "success",
@@ -1301,12 +1478,20 @@ def get_all_thermal_data() -> dict:
     result = {}
     for sensor_id, data in latest_thermal_by_sensor.items():
         out = dict()
-        out["building"] = data.get("building", "Other")
+        meta = _sensor_metadata.get(sensor_id, {})
+        out["building"] = meta.get("building") or data.get("building", "Other")
+        out["room_name"] = meta.get("room_name")
+        out["capacity"] = meta.get("capacity")
         out["last_update"] = last_update_time_by_sensor.get(sensor_id)
         occ = latest_occupancy_by_sensor.get(sensor_id)
         if occ:
             out["occupancy"] = occ.get("occupancy")
             out["room_temperature"] = occ.get("room_temperature")
+            out["any_fever"] = occ.get("any_fever", False)
+            capacity = meta.get("capacity")
+            if capacity:
+                occ_count = occ.get("occupancy") or 0
+                out["occupancy_pct"] = round(occ_count / capacity, 3)
         result[sensor_id] = out
     return result
 
@@ -1372,16 +1557,28 @@ def get_occupancy_stats(
                 values.append(entry["occupancy"])
     if not values:
         raise HTTPException(status_code=404, detail="No occupancy data available")
-    return {
+    avg_raw = sum(values) / len(values)
+    current = values[-1]
+    meta = _sensor_metadata.get(sensor_id or "", {}) if sensor_id else {}
+    capacity = meta.get("capacity")
+    result: dict = {
         "date": date_str,
         "sensor_id": sensor_id,
+        "room_name": meta.get("room_name"),
+        "building": meta.get("building"),
+        "capacity": capacity,
         "total_readings": len(values),
         "min_occupancy": min(values),
         "max_occupancy": max(values),
-        "avg_occupancy": round(sum(values) / len(values), 2),
-        "current_occupancy": values[-1],
+        "avg_occupancy": round(avg_raw, 2),
+        "current_occupancy": current,
         "occupancy_distribution": dict(Counter(values)),
     }
+    if capacity:
+        result["current_occupancy_pct"] = round(current / capacity, 3)
+        result["avg_occupancy_pct"] = round(avg_raw / capacity, 3)
+        result["max_occupancy_pct"] = round(max(values) / capacity, 3)
+    return result
 
 
 def _compute_occupancy_trends(
@@ -1558,6 +1755,8 @@ def get_ml_status() -> dict:
         "fever_label_count": sum(1 for v in labels_snap if v.get("fever")),
         "occupancy_distribution": occ_dist,
         "training": training_snap,
+        "eval": training_snap.get("eval"),
+        "split": training_snap.get("split"),
     }
 
 
@@ -1697,7 +1896,7 @@ def _run_training_thread() -> None:
 
     try:
         from sklearn.ensemble import GradientBoostingClassifier  # noqa: PLC0415
-        from sklearn.model_selection import cross_val_score  # noqa: PLC0415
+        from sklearn.metrics import accuracy_score, f1_score  # noqa: PLC0415
     except ImportError:
         with _ml_training_lock:
             _ml_training_status = {
@@ -1720,27 +1919,38 @@ def _run_training_thread() -> None:
     with _ml_training_lock:
         labels_snap = list(_ml_labels.values())
     log(f"Building features for {len(labels_snap)} labelled frames…")
-    features, occ_targets, fever_targets = [], [], []
-    _tmp_paths: List[Path] = []  # temp files downloaded from Blob; cleaned up below
+
+    # Each row is (frame_timestamp_str, feature_vec, occ_label, fever_label).
+    # Sorting by frame timestamp gives a time-ordered dataset for the
+    # 70/15/15 train/val/test split required by the project proposal.
+    rows: List[Tuple[str, Any, int, int]] = []
+    _tmp_paths: List[Path] = []
 
     for lbl in labels_snap:
         try:
-            # .name strips any path components from hand-edited label files;
-            # post_ml_label() already stores basenames, so this is defence-in-depth.
             safe_file = Path(lbl["file"]).name
             path = _ensure_local_copy(safe_file)
             if path is None:
                 log(f"  Skipping missing file: {lbl['file']}")
                 continue
             if path.parent != DATA_DIR:
-                _tmp_paths.append(path)  # track Blob-download temp files for cleanup
+                _tmp_paths.append(path)
             payload = _read_json_payload(path)
+            raw_ts = payload.get("timestamp", "")
+            try:
+                frame_ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                # Fall back to the filename's embedded date (YYYYMMDD_HHMMSS) so the
+                # split remains time-ordered even when the payload timestamp is absent.
+                stem = Path(lbl["file"]).stem
+                try:
+                    frame_ts = datetime.strptime(stem[:15], "%Y%m%d_%H%M%S")
+                except ValueError:
+                    frame_ts = datetime.min
             compact = payload.get("data") or payload
             arr = thermal_data_to_array(compact)
             bg = thermal_background_by_sensor.get(payload.get("sensor_id"))
-            features.append(_ml_extract(arr, bg))
-            occ_targets.append(int(lbl["occupancy"]))
-            fever_targets.append(1 if lbl.get("fever") else 0)
+            rows.append((frame_ts, _ml_extract(arr, bg), int(lbl["occupancy"]), 1 if lbl.get("fever") else 0))
         except Exception as exc:
             log(f"  Warning: {lbl['file']}: {exc}")
 
@@ -1750,7 +1960,10 @@ def _run_training_thread() -> None:
         except Exception:
             pass
 
-    n = len(features)
+    # Sort by frame timestamp (oldest first) for time-based split.
+    rows.sort(key=lambda r: r[0])
+    n = len(rows)
+
     if n < 10:
         with _ml_training_lock:
             _ml_training_status = {
@@ -1761,37 +1974,65 @@ def _run_training_thread() -> None:
             }
         return
 
+    features   = [r[1] for r in rows]
+    occ_targets   = [r[2] for r in rows]
+    fever_targets = [r[3] for r in rows]
+
     X = np.array(features, dtype=np.float32)
-    y_occ = np.array(occ_targets)
+    y_occ   = np.array(occ_targets)
     y_fever = np.array(fever_targets)
     out_dir = Path(os.environ.get("ML_MODEL_DIR", "ml_models"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log(f"Training occupancy model on {n} samples (classes: {sorted(set(occ_targets))})…")
+    # 70 / 15 / 15 time-based split (proposal specification).
+    train_end = max(1, int(n * 0.70))
+    val_end   = max(train_end + 1, int(n * 0.85))
+    n_train, n_val, n_test = train_end, val_end - train_end, n - val_end
+    log(f"Split: {n_train} train / {n_val} val / {n_test} test (time-ordered, 70/15/15)")
+
+    X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
+    y_occ_train, y_occ_val, y_occ_test     = y_occ[:train_end], y_occ[train_end:val_end], y_occ[val_end:]
+    y_fv_train,  y_fv_val,  y_fv_test      = y_fever[:train_end], y_fever[train_end:val_end], y_fever[val_end:]
+
+    eval_results: dict = {}
+
+    log(f"Training occupancy model on {n_train} samples (classes: {sorted(set(occ_targets[:train_end]))})…")
     occ_clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
-    try:
-        cv = min(5, max(2, n // 5))
-        scores = cross_val_score(occ_clf, X, y_occ, cv=cv, scoring="accuracy")
-        log(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
-    except Exception as exc:
-        log(f"  CV skipped: {exc}")
-    occ_clf.fit(X, y_occ)
+    occ_clf.fit(X_train, y_occ_train)
+    occ_train_acc = accuracy_score(y_occ_train, occ_clf.predict(X_train))
+    log(f"  Train accuracy: {occ_train_acc:.3f}")
+    occ_eval: dict = {"train_accuracy": round(occ_train_acc, 4)}
+    if n_val > 0:
+        occ_val_acc = accuracy_score(y_occ_val, occ_clf.predict(X_val))
+        log(f"  Val   accuracy: {occ_val_acc:.3f}")
+        occ_eval["val_accuracy"] = round(occ_val_acc, 4)
+    if n_test > 0:
+        occ_test_acc = accuracy_score(y_occ_test, occ_clf.predict(X_test))
+        log(f"  Test  accuracy: {occ_test_acc:.3f}")
+        occ_eval["test_accuracy"] = round(occ_test_acc, 4)
+    eval_results["occupancy"] = occ_eval
     _export_onnx_model(occ_clf, X.shape[1], out_dir / "occupancy_model.onnx", "occupancy_model", log)
 
-    fever_pos = int(y_fever.sum())
+    fever_pos = int(y_fv_train.sum())
     if fever_pos >= 5:
-        log(f"Training fever model ({fever_pos}/{n} positive samples)…")
+        log(f"Training fever model ({fever_pos}/{n_train} positive training samples)…")
         fever_clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
-        try:
-            cv = min(5, max(2, n // 5))
-            scores = cross_val_score(fever_clf, X, y_fever, cv=cv, scoring="f1")
-            log(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
-        except Exception as exc:
-            log(f"  CV skipped: {exc}")
-        fever_clf.fit(X, y_fever)
+        fever_clf.fit(X_train, y_fv_train)
+        fv_train_f1 = f1_score(y_fv_train, fever_clf.predict(X_train), zero_division=0)
+        log(f"  Train F1: {fv_train_f1:.3f}")
+        fv_eval: dict = {"train_f1": round(fv_train_f1, 4)}
+        if n_val > 0:
+            fv_val_f1 = f1_score(y_fv_val, fever_clf.predict(X_val), zero_division=0)
+            log(f"  Val   F1: {fv_val_f1:.3f}")
+            fv_eval["val_f1"] = round(fv_val_f1, 4)
+        if n_test > 0:
+            fv_test_f1 = f1_score(y_fv_test, fever_clf.predict(X_test), zero_division=0)
+            log(f"  Test  F1: {fv_test_f1:.3f}")
+            fv_eval["test_f1"] = round(fv_test_f1, 4)
+        eval_results["fever"] = fv_eval
         _export_onnx_model(fever_clf, X.shape[1], out_dir / "fever_model.onnx", "fever_model", log)
     else:
-        log(f"Skipping fever model — need ≥5 positive samples, have {fever_pos}")
+        log(f"Skipping fever model — need ≥5 positive training samples, have {fever_pos}")
 
     log("Reloading ML engine with new models…")
     if _ml_engine:
@@ -1800,9 +2041,11 @@ def _run_training_thread() -> None:
     with _ml_training_lock:
         _ml_training_status = {
             "state": "done",
-            "message": f"Trained on {n} samples.",
+            "message": f"Trained on {n_train} samples (val={n_val}, test={n_test}).",
             "ts": datetime.now().isoformat(),
             "log": log_lines,
+            "eval": eval_results,
+            "split": {"train": n_train, "val": n_val, "test": n_test},
         }
 
 
