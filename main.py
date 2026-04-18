@@ -5,18 +5,19 @@ Designed for Azure App Service (resource group: occupancy-rg, app: occupancy-api
 Stores data locally and optionally to Azure Blob Storage when configured.
 """
 
+import bisect
 import json
 import os
 import gzip
 import threading
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -231,6 +232,8 @@ def _restore_state_from_disk() -> None:
         print(f"Restored state for {len(sensors)} sensor(s): {sorted(sensors)}")
 
     _load_ml_labels()  # called unconditionally — handles missing DATA_DIR gracefully
+    _load_sensor_metadata()
+    _load_ground_truth()
 
 
 app.add_middleware(
@@ -265,6 +268,16 @@ SAVE_DATA = SAVE_LOCAL_DATA
 SQL_CONNECTION_STRING = os.environ.get("SQL_CONNECTION_STRING", "").strip()
 SAVE_TO_SQL = os.environ.get("SAVE_TO_SQL", "true").lower() in ("1", "true", "yes")
 
+# Webhook alert: POST to this URL on fever detection (rising edge) or room overcapacity.
+# Leave empty to disable. Fires in a background thread so it never delays the API response.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
+# Fraction of capacity that triggers an overcapacity alert (default 1.0 = at or above capacity).
+ALERT_OVERCAPACITY_PCT = float(os.environ.get("ALERT_OVERCAPACITY_PCT", "1.0"))
+
+# Optional API key protecting ground truth mutation endpoints (POST/DELETE).
+# When set, callers must supply the matching X-API-Key header.
+GROUND_TRUTH_API_KEY: Optional[str] = os.environ.get("GROUND_TRUTH_API_KEY") or None
+
 # Occupancy detection parameters
 MIN_HUMAN_TEMP = 30.0
 MAX_HUMAN_TEMP = 45.0
@@ -274,6 +287,19 @@ ROOM_TEMP_THRESHOLD = float(os.environ.get("ROOM_TEMP_THRESHOLD", "0.5"))
 FEVER_THRESHOLD_C = float(os.environ.get("FEVER_THRESHOLD_C", "37.5"))
 FEVER_ELEVATED_THRESHOLD_C = float(os.environ.get("FEVER_ELEVATED_THRESHOLD_C", "37.0"))
 FEVER_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("FEVER_MIN_CONSECUTIVE_FRAMES", "2")))
+# Cluster shape filters: reject elongated or sparse blobs (radiators, hot pipes, warm walls).
+# Aspect ratio = max(bbox_w, bbox_h) / min(bbox_w, bbox_h); >4 → likely not a person.
+# Fill ratio = cluster pixels / bbox area; <0.15 → too diffuse to be a person.
+MAX_CLUSTER_ASPECT_RATIO = float(os.environ.get("MAX_CLUSTER_ASPECT_RATIO", "4.0"))
+MIN_CLUSTER_FILL_RATIO = float(os.environ.get("MIN_CLUSTER_FILL_RATIO", "0.15"))
+# Ambient-temperature fever compensation: the MLX90640 reads skin surface temperature, which
+# rises with room temperature.  For every 1°C the room is above FEVER_REFERENCE_ROOM_C the
+# effective fever/elevated thresholds increase by FEVER_AMBIENT_COMP_C to reduce false positives.
+FEVER_REFERENCE_ROOM_C = float(os.environ.get("FEVER_REFERENCE_ROOM_C", "22.0"))
+FEVER_AMBIENT_COMP_C = float(os.environ.get("FEVER_AMBIENT_COMP_C", "0.1"))
+# Sustained elevated temperature alert: flag a cluster when it has been in the elevated-temp
+# range for this many consecutive frames (independent of the full-fever gate).
+ELEVATED_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("ELEVATED_MIN_CONSECUTIVE_FRAMES", "5")))
 
 # MLX90640 subpage artifact detection
 # The sensor alternates subpages; a moving body can produce a checkerboard double-image.
@@ -299,11 +325,23 @@ thermal_background_by_sensor: Dict[str, np.ndarray] = {}
 empty_frame_count_by_sensor: Dict[str, int] = {}
 last_empty_frame_thermal_by_sensor: Dict[str, np.ndarray] = {}
 
+# Long-term stationary-source background: updated on EVERY frame regardless of occupancy.
+# Uses a very slow EMA so heat sources present all day (radiators, monitors, warm walls)
+# are gradually absorbed and no longer trigger false-positive people detections.
+# Default α=0.9995 → time constant ≈ 2000 frames.  At 15 s/frame that is ~8 hours,
+# meaning a source that has been on all day reaches ~98% absorption after 24 hours.
+STATIONARY_BG_ALPHA = float(os.environ.get("STATIONARY_BG_ALPHA", "0.9995"))
+# Persist to disk every N frames to avoid I/O on every upload (~15 min at default).
+STATIONARY_BG_SAVE_INTERVAL = max(1, int(os.environ.get("STATIONARY_BG_SAVE_INTERVAL", "60")))
+stationary_thermal_background_by_sensor: Dict[str, np.ndarray] = {}
+_stationary_bg_frame_count: Dict[str, int] = {}
+
 occupancy_raw_history_by_sensor: Dict[str, deque] = {}
 last_frame_median_by_sensor: Dict[str, float] = {}
 last_raw_occupancy_by_sensor: Dict[str, int] = {}
 last_smoothed_occupancy_by_sensor: Dict[str, int] = {}
 fever_consecutive_by_sensor: Dict[str, int] = {}
+elevated_consecutive_by_sensor: Dict[str, int] = {}
 # Per-sensor last clean (non-subpage-corrupted) frame for fallback interpolation
 _last_clean_frame_by_sensor: Dict[str, np.ndarray] = {}
 
@@ -321,8 +359,22 @@ if SAVE_LOCAL_DATA:
 
 # ML labelling and training state
 _ml_labels: Dict[str, dict] = {}  # filename → {file, occupancy, fever, ts}
+
+# Ground truth labels for accuracy evaluation.
+# Keyed by (timestamp_iso, sensor_id) as a string "ts|sid" for dedup.
+_ground_truth: Dict[str, dict] = {}  # key → {timestamp, sensor_id, actual_occupancy, actual_fever, ts_added}
+_ground_truth_lock = threading.Lock()
+_ground_truth_persist_lock = threading.Lock()  # serialises file/blob writes
 _ml_training_status: dict = {"state": "idle", "message": "", "ts": None, "log": []}
 _ml_training_lock = threading.Lock()
+
+# Per-sensor room metadata (room_name, capacity, building).
+_sensor_metadata: Dict[str, dict] = {}  # sensor_id → {room_name, capacity, building, ts_updated}
+_sensor_metadata_lock = threading.Lock()
+
+# Previous alert state per sensor — used to detect fever/overcapacity rising edges.
+_last_alert_state_by_sensor: Dict[str, dict] = {}  # sensor_id → {fever: bool, overcapacity: bool}
+_alert_state_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
@@ -381,6 +433,203 @@ def _persist_ml_labels() -> None:
             print(f"Error uploading ML labels to Blob: {e}")
 
 
+def _load_sensor_metadata() -> None:
+    """Load persisted sensor metadata (room_name, capacity, building) from disk or Blob."""
+    global _sensor_metadata
+    raw: Optional[bytes] = None
+    if DATA_DIR.exists():
+        path = DATA_DIR / "sensor_metadata.json"
+        if path.exists():
+            try:
+                raw = path.read_bytes()
+            except Exception as e:
+                print(f"Could not read sensor_metadata.json: {e}")
+    if raw is None:
+        container = _get_blob_container()
+        if container is not None:
+            try:
+                raw = container.get_blob_client("sensor_metadata.json").download_blob().readall()
+            except Exception:
+                pass
+    if raw:
+        try:
+            loaded = json.loads(raw.decode("utf-8"))
+            if isinstance(loaded, dict):
+                normalized: Dict[str, dict] = {}
+                for sid, entry in loaded.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    clean: dict = {}
+                    for field in ("room_name", "building", "ts_updated"):
+                        if field in entry:
+                            clean[field] = entry[field]
+                    if "capacity" in entry:
+                        try:
+                            clean["capacity"] = int(entry["capacity"])
+                        except (TypeError, ValueError):
+                            pass  # drop unparseable capacity
+                    normalized[sid] = clean
+                with _sensor_metadata_lock:
+                    _sensor_metadata.clear()
+                    _sensor_metadata.update(normalized)
+                print(f"Loaded metadata for {len(normalized)} sensor(s)")
+        except Exception as e:
+            print(f"Could not parse sensor_metadata.json: {e}")
+
+
+def _persist_sensor_metadata() -> None:
+    """Write sensor metadata to disk and Blob."""
+    with _sensor_metadata_lock:
+        snapshot = dict(_sensor_metadata)
+    content = json.dumps(snapshot, indent=2).encode("utf-8")
+    if SAVE_LOCAL_DATA:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            (DATA_DIR / "sensor_metadata.json").write_bytes(content)
+        except Exception as e:
+            print(f"Error saving sensor_metadata.json: {e}")
+    if SAVE_TO_BLOB:
+        try:
+            _upload_blob("sensor_metadata.json", content, content_type="application/json")
+        except Exception as e:
+            print(f"Error uploading sensor_metadata.json: {e}")
+
+
+def _fire_webhook(payload: dict) -> None:
+    """POST alert payload to ALERT_WEBHOOK_URL. Called in a daemon thread."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    import urllib.request  # noqa: PLC0415
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            ALERT_WEBHOOK_URL,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"[Alert] webhook OK ({resp.status}): {payload.get('alert_type')} for {payload.get('sensor_id')}")
+    except Exception as e:
+        print(f"[Alert] webhook failed: {e}")
+
+
+def _maybe_fire_alerts(sensor_id: str, occupancy_result: dict, now_iso: str) -> None:
+    """Detect rising edges on fever and overcapacity; fire webhook once per transition."""
+    if not ALERT_WEBHOOK_URL:
+        return
+
+    curr_fever = bool(occupancy_result.get("any_fever", False))
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
+    capacity = meta.get("capacity")
+    occ = int(occupancy_result.get("occupancy", 0))
+    curr_overcapacity = (
+        capacity is not None and capacity > 0 and occ / capacity >= ALERT_OVERCAPACITY_PCT
+    )
+
+    with _alert_state_lock:
+        prev = _last_alert_state_by_sensor.get(sensor_id, {"fever": False, "overcapacity": False})
+        new_fever = curr_fever and not prev["fever"]
+        new_overcapacity = curr_overcapacity and not prev["overcapacity"]
+        _last_alert_state_by_sensor[sensor_id] = {"fever": curr_fever, "overcapacity": curr_overcapacity}
+
+    alerts = []
+    if new_fever:
+        alerts.append({
+            "alert_type": "fever",
+            "sensor_id": sensor_id,
+            "room_name": meta.get("room_name"),
+            "building": meta.get("building"),
+            "timestamp": now_iso,
+            "occupancy": occ,
+            "fever_count": int(occupancy_result.get("fever_count", 0)),
+            "effective_fever_threshold": occupancy_result.get("effective_fever_threshold"),
+            "message": "Fever detected — room may require disinfection.",
+        })
+    if new_overcapacity:
+        alerts.append({
+            "alert_type": "overcapacity",
+            "sensor_id": sensor_id,
+            "room_name": meta.get("room_name"),
+            "building": meta.get("building"),
+            "timestamp": now_iso,
+            "occupancy": occ,
+            "capacity": capacity,
+            "occupancy_pct": round(occ / capacity, 3),
+            "message": f"Room at or above capacity ({occ}/{capacity}).",
+        })
+
+    for alert in alerts:
+        threading.Thread(target=_fire_webhook, args=(alert,), daemon=True).start()
+
+
+def _load_ground_truth() -> None:
+    """Load persisted ground truth entries into _ground_truth from disk or Blob."""
+    global _ground_truth
+    loaded: Dict[str, dict] = {}
+
+    def _ingest(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            entry = json.loads(line)
+        except Exception:
+            return
+        ts = entry.get("timestamp", "")
+        sid = entry.get("sensor_id", "")
+        if ts and isinstance(sid, str):
+            sid = sid.strip()
+            if sid:
+                loaded[f"{ts}|{sid}"] = entry
+
+    if DATA_DIR.exists():
+        path = DATA_DIR / "ground_truth.jsonl"
+        if path.exists():
+            try:
+                for line in path.read_text().splitlines():
+                    _ingest(line)
+            except Exception as e:
+                print(f"Could not load ground truth locally: {e}")
+
+    if not loaded:
+        container = _get_blob_container()
+        if container is not None:
+            try:
+                raw = container.get_blob_client("occupancy/ground_truth.jsonl").download_blob().readall()
+                for line in raw.decode("utf-8").splitlines():
+                    _ingest(line)
+            except Exception as e:
+                print(f"Could not load ground truth from Blob: {e}")
+
+    _ground_truth = loaded
+    if loaded:
+        print(f"Loaded {len(loaded)} ground truth entry/entries")
+
+
+def _persist_ground_truth() -> None:
+    """Rewrite ground_truth.jsonl from in-memory dict and sync to Blob."""
+    with _ground_truth_lock:
+        snapshot = list(_ground_truth.values())
+    with _ground_truth_persist_lock:
+        if SAVE_LOCAL_DATA:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "ground_truth.jsonl"
+            try:
+                with open(path, "w") as f:
+                    for entry in snapshot:
+                        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            except Exception as e:
+                print(f"Error saving ground truth locally: {e}")
+        if SAVE_TO_BLOB:
+            try:
+                content = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in snapshot)
+                _upload_blob("occupancy/ground_truth.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
+            except Exception as e:
+                print(f"Error uploading ground truth to Blob: {e}")
+
+
 def _load_thermal_background(sensor_id: str) -> None:
     """Load persisted thermal background for a sensor from disk if present."""
     safe_id = _sanitize_sensor_id_for_filename(sensor_id)
@@ -405,6 +654,57 @@ def _save_thermal_background(sensor_id: str) -> None:
         np.save(path, arr)
     except Exception as e:
         print(f"Error saving thermal background ({sensor_id}): {e}")
+
+
+def _load_stationary_background(sensor_id: str) -> None:
+    """Load persisted stationary background for a sensor from disk if present."""
+    safe_id = _sanitize_sensor_id_for_filename(sensor_id)
+    path = DATA_DIR / f"background_stationary_{safe_id}.npy"
+    if path.exists():
+        try:
+            stationary_thermal_background_by_sensor[sensor_id] = np.load(path)
+        except Exception:
+            pass
+
+
+def _save_stationary_background(sensor_id: str) -> None:
+    """Persist stationary background for a sensor to disk."""
+    if not SAVE_LOCAL_DATA:
+        return
+    arr = stationary_thermal_background_by_sensor.get(sensor_id)
+    if arr is None:
+        return
+    safe_id = _sanitize_sensor_id_for_filename(sensor_id)
+    path = DATA_DIR / f"background_stationary_{safe_id}.npy"
+    try:
+        np.save(path, arr)
+    except Exception as e:
+        print(f"Error saving stationary background ({sensor_id}): {e}")
+
+
+def _update_stationary_background(sensor_id: str, temp_array_2d: np.ndarray) -> None:
+    """Slow EMA update of the stationary background — runs on every frame.
+
+    Unlike the empty-room background, this accumulates regardless of occupancy.
+    Heat sources that are present all day (radiators, computers, warm walls) will
+    converge toward their actual temperature in this background over ~8 hours,
+    so the delta used for people detection approaches zero for those pixels.
+    People produce a large delta because they are only transiently present at any
+    given pixel, so their contribution averages out much more slowly than a full day.
+    """
+    global stationary_thermal_background_by_sensor, _stationary_bg_frame_count
+    arr = temp_array_2d.astype(np.float64)
+    if sensor_id not in stationary_thermal_background_by_sensor:
+        stationary_thermal_background_by_sensor[sensor_id] = arr.copy()
+        _stationary_bg_frame_count[sensor_id] = 1
+    else:
+        bg = stationary_thermal_background_by_sensor[sensor_id]
+        stationary_thermal_background_by_sensor[sensor_id] = (
+            STATIONARY_BG_ALPHA * bg + (1.0 - STATIONARY_BG_ALPHA) * arr
+        )
+        _stationary_bg_frame_count[sensor_id] = _stationary_bg_frame_count.get(sensor_id, 0) + 1
+    if _stationary_bg_frame_count.get(sensor_id, 0) % STATIONARY_BG_SAVE_INTERVAL == 0:
+        _save_stationary_background(sensor_id)
 
 
 def _parse_temperature(value: Any) -> float:
@@ -626,32 +926,58 @@ def detect_human_heat(
     return human_mask.astype(int)
 
 
-def find_people_clusters(human_mask: np.ndarray, temp_array: np.ndarray) -> List[Dict]:
+def find_people_clusters(
+    human_mask: np.ndarray,
+    temp_array: np.ndarray,
+    fever_threshold: Optional[float] = None,
+    elevated_threshold: Optional[float] = None,
+) -> List[Dict]:
+    """Detect human clusters with shape and temperature filtering.
+
+    ``fever_threshold`` / ``elevated_threshold`` allow the caller to pass
+    ambient-compensated values; fall back to global constants when absent.
+    """
+    eff_fever = fever_threshold if fever_threshold is not None else FEVER_THRESHOLD_C
+    eff_elevated = elevated_threshold if elevated_threshold is not None else FEVER_ELEVATED_THRESHOLD_C
+
     structure = np.ones((3, 3), dtype=int)
     labeled_array, num_features = label(human_mask, structure=structure)
     people_clusters = []
     for i in range(1, num_features + 1):
         cluster_size = int(np.sum(labeled_array == i))
-        if MIN_CLUSTER_SIZE <= cluster_size <= MAX_CLUSTER_SIZE:
-            cluster_pixels = np.where(labeled_array == i)
-            center_row = int(np.mean(cluster_pixels[0]))
-            center_col = int(np.mean(cluster_pixels[1]))
-            cluster_temps = temp_array[cluster_pixels[0], cluster_pixels[1]]
-            representative_temp_c = float(np.percentile(cluster_temps, 90)) if cluster_temps.size else 0.0
-            fever_detected = representative_temp_c >= FEVER_THRESHOLD_C
-            elevated_temp = (
-                FEVER_ELEVATED_THRESHOLD_C > 0
-                and representative_temp_c >= FEVER_ELEVATED_THRESHOLD_C
-                and representative_temp_c < FEVER_THRESHOLD_C
-            )
-            people_clusters.append({
-                "id": i,
-                "size": cluster_size,
-                "center": (center_row, center_col),
-                "representative_temp_c": round(representative_temp_c, 2),
-                "elevated_temp": elevated_temp,
-                "fever_detected": fever_detected,
-            })
+        if not (MIN_CLUSTER_SIZE <= cluster_size <= MAX_CLUSTER_SIZE):
+            continue
+        cluster_pixels = np.where(labeled_array == i)
+        rows, cols = cluster_pixels
+        # Bounding-box shape filters: reject elongated and very sparse blobs.
+        bbox_h = int(rows.max() - rows.min()) + 1
+        bbox_w = int(cols.max() - cols.min()) + 1
+        long_side = max(bbox_h, bbox_w)
+        short_side = min(bbox_h, bbox_w)
+        aspect_ratio = long_side / max(short_side, 1)
+        fill_ratio = cluster_size / max(bbox_h * bbox_w, 1)
+        if aspect_ratio > MAX_CLUSTER_ASPECT_RATIO or fill_ratio < MIN_CLUSTER_FILL_RATIO:
+            continue
+        center_row = int(np.mean(rows))
+        center_col = int(np.mean(cols))
+        cluster_temps = temp_array[rows, cols]
+        representative_temp_c = float(np.percentile(cluster_temps, 90)) if cluster_temps.size else 0.0
+        fever_detected = representative_temp_c >= eff_fever
+        elevated_temp = (
+            eff_elevated > 0
+            and representative_temp_c >= eff_elevated
+            and representative_temp_c < eff_fever
+        )
+        people_clusters.append({
+            "id": i,
+            "size": cluster_size,
+            "center": (center_row, center_col),
+            "representative_temp_c": round(representative_temp_c, 2),
+            "elevated_temp": elevated_temp,
+            "fever_detected": fever_detected,
+            "aspect_ratio": round(aspect_ratio, 2),
+            "fill_ratio": round(fill_ratio, 2),
+        })
     return people_clusters
 
 
@@ -672,10 +998,24 @@ def estimate_occupancy(
         room_temp = estimate_room_temperature(temp_array_2d)
         array_for_detection = temp_array_2d
         use_delta = False
-        if sensor_id and sensor_id in thermal_background_by_sensor:
-            background = thermal_background_by_sensor[sensor_id]
-            if background.shape == temp_array_2d.shape:
-                delta = np.maximum(0.0, temp_array_2d - background)
+        if sensor_id:
+            # Combine the empty-room background (fast, only updates when unoccupied) with
+            # the stationary background (slow, always updates) by taking the per-pixel
+            # maximum.  This cancels out both ambient shifts and always-on heat sources
+            # (radiators, monitors, warm walls) without requiring the room to be empty.
+            empty_bg = thermal_background_by_sensor.get(sensor_id)
+            stationary_bg = stationary_thermal_background_by_sensor.get(sensor_id)
+            combined_bg: Optional[np.ndarray] = None
+            if empty_bg is not None and empty_bg.shape == temp_array_2d.shape:
+                combined_bg = empty_bg
+            if stationary_bg is not None and stationary_bg.shape == temp_array_2d.shape:
+                combined_bg = (
+                    np.maximum(combined_bg, stationary_bg)
+                    if combined_bg is not None
+                    else stationary_bg
+                )
+            if combined_bg is not None:
+                delta = np.maximum(0.0, temp_array_2d - combined_bg)
                 array_for_detection = delta
                 use_delta = True
         human_mask = detect_human_heat(
@@ -684,7 +1024,17 @@ def estimate_occupancy(
             use_delta=use_delta,
             absolute_temp_array=temp_array_2d if use_delta else None,
         )
-        people_clusters = find_people_clusters(human_mask, temp_array_2d)
+        # Ambient-compensated fever thresholds: skin surface temperature tracks room
+        # temperature, so the absolute fever threshold needs to shift with ambient.
+        ambient_delta = room_temp - FEVER_REFERENCE_ROOM_C
+        comp = FEVER_AMBIENT_COMP_C * ambient_delta
+        eff_fever = FEVER_THRESHOLD_C + comp
+        eff_elevated = FEVER_ELEVATED_THRESHOLD_C + comp if FEVER_ELEVATED_THRESHOLD_C > 0 else 0.0
+        people_clusters = find_people_clusters(
+            human_mask, temp_array_2d,
+            fever_threshold=eff_fever,
+            elevated_threshold=eff_elevated,
+        )
         fever_count = sum(1 for c in people_clusters if c.get("fever_detected"))
         elevated_count = sum(1 for c in people_clusters if c.get("elevated_temp"))
         return {
@@ -695,6 +1045,7 @@ def estimate_occupancy(
             "elevated_count": elevated_count,
             "any_fever": fever_count > 0,
             "any_elevated": elevated_count > 0,
+            "effective_fever_threshold": round(eff_fever, 2),
             "subpage_corrupted": subpage_corrupted,
             "subpage_checkerboard_frac": round(subpage_frac, 3),
         }
@@ -770,6 +1121,16 @@ def apply_occupancy_signal_processing(
         occupancy_result["any_fever"] = True
     else:
         occupancy_result["any_fever"] = False
+
+    # Sustained elevated-temperature gate (independent of full fever).
+    any_elevated_raw = bool(occupancy_result.get("any_elevated", False))
+    if any_elevated_raw:
+        elevated_consecutive_by_sensor[sensor_id] = elevated_consecutive_by_sensor.get(sensor_id, 0) + 1
+    else:
+        elevated_consecutive_by_sensor[sensor_id] = 0
+    elevated_streak = elevated_consecutive_by_sensor[sensor_id]
+    occupancy_result["elevated_consecutive_frames"] = elevated_streak
+    occupancy_result["sustained_elevated"] = elevated_streak >= ELEVATED_MIN_CONSECUTIVE_FRAMES
 
 
 def _sanitize_sensor_id_for_filename(sensor_id: Optional[str]) -> str:
@@ -954,6 +1315,9 @@ def save_occupancy_data(occupancy_result: dict) -> None:
             "any_fever_raw": bool(occupancy_result.get("any_fever_raw", occupancy_result.get("any_fever", False))),
             "any_elevated": bool(occupancy_result.get("any_elevated", False)),
             "fever_consecutive_frames": int(occupancy_result.get("fever_consecutive_frames", 0)),
+            "elevated_consecutive_frames": int(occupancy_result.get("elevated_consecutive_frames", 0)),
+            "sustained_elevated": bool(occupancy_result.get("sustained_elevated", False)),
+            "effective_fever_threshold": occupancy_result.get("effective_fever_threshold"),
             "frame_valid": bool(occupancy_result.get("frame_valid", True)),
         }
         line = json.dumps(entry) + "\n"
@@ -1084,12 +1448,9 @@ def _safe_int(value: Optional[int], default: int, min_value: int, max_value: int
 
 @app.get("/api/sensors")
 def list_sensors() -> dict:
-    """List known sensor IDs (from memory + stored files)."""
+    """List known sensor IDs with any stored room metadata."""
     sensors = set(latest_thermal_by_sensor.keys()) | set(latest_occupancy_by_sensor.keys())
-    # Add sensors found on disk
     for p in _iter_thermal_files():
-        # Filename: thermal_<safe_id>_<ts>_<suffix>.json(.gz) ; safe_id may differ from original.
-        # Prefer payload sensor_id for correctness.
         try:
             payload = _read_json_payload(p)
             sid = payload.get("sensor_id")
@@ -1098,7 +1459,40 @@ def list_sensors() -> dict:
         except Exception:
             continue
     out = sorted(sensors)
-    return {"count": len(out), "sensors": out}
+    return {
+        "count": len(out),
+        "sensors": out,
+        "metadata": {sid: _sensor_metadata.get(sid, {}) for sid in out},
+    }
+
+
+class _SensorMetadataUpdate(BaseModel):
+    room_name: Optional[str] = None
+    capacity: Optional[int] = None
+    building: Optional[str] = None
+
+
+@app.patch("/api/sensors/{sensor_id}")
+def update_sensor_metadata(sensor_id: str, update: _SensorMetadataUpdate) -> dict:
+    """Set room name, capacity, and/or building for a sensor.
+
+    Only supplied fields are updated; omitted fields are left unchanged.
+    Capacity is used for occupancy percentage reporting and overcapacity alerts.
+    """
+    if update.capacity is not None and update.capacity < 0:
+        raise HTTPException(status_code=400, detail="capacity must be >= 0")
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
+        if update.room_name is not None:
+            meta["room_name"] = update.room_name
+        if update.capacity is not None:
+            meta["capacity"] = update.capacity
+        if update.building is not None:
+            meta["building"] = update.building
+        meta["ts_updated"] = datetime.now(timezone.utc).isoformat()
+        _sensor_metadata[sensor_id] = meta
+    _persist_sensor_metadata()
+    return {"sensor_id": sensor_id, "metadata": meta}
 
 
 @app.get("/api/thermal/history")
@@ -1283,6 +1677,8 @@ def receive_thermal_data(data: dict) -> dict:
     sensor_id = data.get("sensor_id") or "unknown"
     if sensor_id not in thermal_background_by_sensor:
         _load_thermal_background(sensor_id)
+    if sensor_id not in stationary_thermal_background_by_sensor:
+        _load_stationary_background(sensor_id)
     if "t" in data:
         compact_data = dict(data)
         try:
@@ -1306,11 +1702,16 @@ def receive_thermal_data(data: dict) -> dict:
         _maybe_update_thermal_background(
             sensor_id, corrected_frame, int(occupancy_result.get("occupancy_effective_raw", 0))
         )
+        _update_stationary_background(sensor_id, temp_array_2d)
         if _ml_engine is not None and _ml_engine.available:
-            ml_result = _ml_engine.predict(
-                temp_array_2d,
-                background=thermal_background_by_sensor.get(sensor_id),
+            empty_bg = thermal_background_by_sensor.get(sensor_id)
+            stat_bg = stationary_thermal_background_by_sensor.get(sensor_id)
+            ml_bg = (
+                np.maximum(empty_bg, stat_bg)
+                if empty_bg is not None and stat_bg is not None and empty_bg.shape == stat_bg.shape
+                else (empty_bg if empty_bg is not None else stat_bg)
             )
+            ml_result = _ml_engine.predict(temp_array_2d, background=ml_bg)
             if ml_result:
                 occupancy_result["ml"] = ml_result
     except Exception as e:
@@ -1325,6 +1726,7 @@ def receive_thermal_data(data: dict) -> dict:
     save_thermal_data(compact_data, sensor_id)
     save_occupancy_data(occupancy_result)
     save_occupancy_data_sql(occupancy_result, timestamp_iso=now_iso)
+    _maybe_fire_alerts(sensor_id, occupancy_result, now_iso)
     pixel_count = len(latest_thermal_data.get("pixels", []))
     return {
         "status": "success",
@@ -1339,6 +1741,9 @@ def receive_thermal_data(data: dict) -> dict:
         "any_fever_raw": occupancy_result.get("any_fever_raw", False),
         "any_elevated": occupancy_result.get("any_elevated", False),
         "fever_consecutive_frames": occupancy_result.get("fever_consecutive_frames", 0),
+        "elevated_consecutive_frames": occupancy_result.get("elevated_consecutive_frames", 0),
+        "sustained_elevated": occupancy_result.get("sustained_elevated", False),
+        "effective_fever_threshold": occupancy_result.get("effective_fever_threshold"),
     }
 
 
@@ -1367,6 +1772,9 @@ def get_thermal_data(
             out["any_fever_raw"] = occ.get("any_fever_raw", False)
             out["any_elevated"] = occ.get("any_elevated", False)
             out["fever_consecutive_frames"] = occ.get("fever_consecutive_frames", 0)
+            out["elevated_consecutive_frames"] = occ.get("elevated_consecutive_frames", 0)
+            out["sustained_elevated"] = occ.get("sustained_elevated", False)
+            out["effective_fever_threshold"] = occ.get("effective_fever_threshold")
             ml = occ.get("ml") or {}
             out["ml_occupancy"] = ml.get("ml_occupancy")
             out["ml_occupancy_confidence"] = ml.get("ml_occupancy_confidence")
@@ -1393,6 +1801,9 @@ def get_thermal_data(
         out["any_fever_raw"] = latest_occupancy.get("any_fever_raw", False)
         out["any_elevated"] = latest_occupancy.get("any_elevated", False)
         out["fever_consecutive_frames"] = latest_occupancy.get("fever_consecutive_frames", 0)
+        out["elevated_consecutive_frames"] = latest_occupancy.get("elevated_consecutive_frames", 0)
+        out["sustained_elevated"] = latest_occupancy.get("sustained_elevated", False)
+        out["effective_fever_threshold"] = latest_occupancy.get("effective_fever_threshold")
         ml = latest_occupancy.get("ml") or {}
         out["ml_occupancy"] = ml.get("ml_occupancy")
         out["ml_occupancy_confidence"] = ml.get("ml_occupancy_confidence")
@@ -1407,12 +1818,20 @@ def get_all_thermal_data() -> dict:
     result = {}
     for sensor_id, data in latest_thermal_by_sensor.items():
         out = dict()
-        out["building"] = data.get("building", "Other")
+        meta = _sensor_metadata.get(sensor_id, {})
+        out["building"] = meta.get("building") or data.get("building", "Other")
+        out["room_name"] = meta.get("room_name")
+        out["capacity"] = meta.get("capacity")
         out["last_update"] = last_update_time_by_sensor.get(sensor_id)
         occ = latest_occupancy_by_sensor.get(sensor_id)
         if occ:
             out["occupancy"] = occ.get("occupancy")
             out["room_temperature"] = occ.get("room_temperature")
+            out["any_fever"] = occ.get("any_fever", False)
+            capacity = meta.get("capacity")
+            if capacity:
+                occ_count = occ.get("occupancy") or 0
+                out["occupancy_pct"] = round(occ_count / capacity, 3)
         result[sensor_id] = out
     return result
 
@@ -1478,16 +1897,28 @@ def get_occupancy_stats(
                 values.append(entry["occupancy"])
     if not values:
         raise HTTPException(status_code=404, detail="No occupancy data available")
-    return {
+    avg_raw = sum(values) / len(values)
+    current = values[-1]
+    meta = _sensor_metadata.get(sensor_id or "", {}) if sensor_id else {}
+    capacity = meta.get("capacity")
+    result: dict = {
         "date": date_str,
         "sensor_id": sensor_id,
+        "room_name": meta.get("room_name"),
+        "building": meta.get("building"),
+        "capacity": capacity,
         "total_readings": len(values),
         "min_occupancy": min(values),
         "max_occupancy": max(values),
-        "avg_occupancy": round(sum(values) / len(values), 2),
-        "current_occupancy": values[-1],
+        "avg_occupancy": round(avg_raw, 2),
+        "current_occupancy": current,
         "occupancy_distribution": dict(Counter(values)),
     }
+    if capacity:
+        result["current_occupancy_pct"] = round(current / capacity, 3)
+        result["avg_occupancy_pct"] = round(avg_raw / capacity, 3)
+        result["max_occupancy_pct"] = round(max(values) / capacity, 3)
+    return result
 
 
 def _compute_occupancy_trends(
@@ -1572,11 +2003,19 @@ def get_occupancy_trends(
 
 
 def _predict_occupancy_heuristic(sensor_id: Optional[str], horizon_hours: int) -> List[dict]:
-    """Predict occupancy for next horizon_hours using same hour-of-day average over last 7 days."""
+    """Predict occupancy using day-of-week + hour-of-day pattern from up to 28 days of history.
+
+    For each target bucket we collect historical readings that share both the same
+    weekday and the same hour (primary).  When fewer than 3 samples exist for that
+    specific weekday+hour combination we fall back to using all readings for that
+    hour across any weekday (secondary).  This produces better predictions for
+    rooms with strong weekly schedules (e.g. a lecture hall empty on weekends).
+    """
     now = datetime.now()
-    # By hour-of-day (0..23), list of occupancy values from last 7 days
+    # Collect readings keyed by (weekday 0=Mon, hour) and by hour alone (fallback).
+    by_dow_hour: Dict[Tuple[int, int], List[int]] = {}
     by_hour: Dict[int, List[int]] = {h: [] for h in range(24)}
-    for day_offset in range(1, 8):
+    for day_offset in range(1, 29):  # up to 4 weeks back
         d = now - timedelta(days=day_offset)
         date_str = d.strftime("%Y%m%d")
         path = DATA_DIR / f"occupancy_{date_str}.jsonl"
@@ -1599,23 +2038,47 @@ def _predict_occupancy_heuristic(sensor_id: Optional[str], horizon_hours: int) -
                     dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                 except Exception:
                     continue
-                by_hour[dt.hour].append(entry["occupancy"])
-    # Average per hour-of-day (no data -> 0)
-    avg_by_hour: Dict[int, float] = {}
-    for h in range(24):
-        vals = by_hour[h]
-        avg_by_hour[h] = round(sum(vals) / len(vals), 2) if vals else 0.0
-    # Build prediction for next horizon_hours (starting at current hour)
+                val = entry["occupancy"]
+                key = (dt.weekday(), dt.hour)
+                if key not in by_dow_hour:
+                    by_dow_hour[key] = []
+                by_dow_hour[key].append(val)
+                by_hour[dt.hour].append(val)
+
+    def _stats(vals: List[int]) -> dict:
+        avg = sum(vals) / len(vals)
+        variance = sum((v - avg) ** 2 for v in vals) / len(vals)
+        return {
+            "expected_occupancy": round(avg, 2),
+            "min_occupancy": min(vals),
+            "max_occupancy": max(vals),
+            "std_occupancy": round(variance ** 0.5, 2),
+            "sample_count": len(vals),
+        }
+
     out = []
     for i in range(horizon_hours):
         t = now + timedelta(hours=i)
-        h = t.hour
         bucket_start = t.replace(minute=0, second=0, microsecond=0)
         bucket_end = bucket_start + timedelta(hours=1)
+        key = (t.weekday(), t.hour)
+        dow_vals = by_dow_hour.get(key, [])
+        hour_vals = by_hour[t.hour]
+        if len(dow_vals) >= 3:
+            s = _stats(dow_vals)
+            method = "weekday+hour"
+        elif hour_vals:
+            s = _stats(hour_vals)
+            method = "hour"
+        else:
+            s = {"expected_occupancy": 0.0, "min_occupancy": 0, "max_occupancy": 0,
+                 "std_occupancy": 0.0, "sample_count": 0}
+            method = "no_data"
         out.append({
             "bucket_start": bucket_start.isoformat(),
             "bucket_end": bucket_end.isoformat(),
-            "expected_occupancy": avg_by_hour[h],
+            "method": method,
+            **s,
         })
     return out
 
@@ -1623,9 +2086,9 @@ def _predict_occupancy_heuristic(sensor_id: Optional[str], horizon_hours: int) -
 @app.get("/api/occupancy/predict")
 def get_occupancy_predict(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
-    horizon_hours: int = Query(default=24, ge=1, le=48, description="Number of hours to predict (1..48)"),
+    horizon_hours: int = Query(default=24, ge=1, le=168, description="Number of hours to predict (1..168)"),
 ) -> dict:
-    """Predicted occupancy for next hours based on same hour-of-day average over last 7 days (heuristic)."""
+    """Predicted occupancy using day-of-week + hour pattern from up to 28 days of history."""
     predictions = _predict_occupancy_heuristic(sensor_id, horizon_hours)
     return {
         "sensor_id": sensor_id,
@@ -1633,6 +2096,409 @@ def get_occupancy_predict(
         "count": len(predictions),
         "data": predictions,
     }
+
+
+# ---------------------------------------------------------------------------
+# Ground truth & accuracy endpoints
+# ---------------------------------------------------------------------------
+
+class _GroundTruthEntry(BaseModel):
+    timestamp: str           # ISO 8601, e.g. "2026-04-17T14:30:00"
+    sensor_id: str
+    actual_occupancy: int    # true headcount at that moment
+    actual_fever: Optional[bool] = None  # True if a fever was present
+
+
+def _load_occupancy_history_for_accuracy(
+    sensor_id: Optional[str],
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+) -> List[dict]:
+    """Read all occupancy JSONL files, parse timestamps, optionally filter."""
+    entries: List[dict] = []
+    if not DATA_DIR.exists():
+        return entries
+    for path in sorted(DATA_DIR.glob("occupancy_*.jsonl")):
+        if not path.is_file():
+            continue
+        # Early-prune by date embedded in filename (occupancy_YYYYMMDD.jsonl)
+        if since is not None or until is not None:
+            try:
+                day_str = path.stem[len("occupancy_"):]
+                file_day = datetime.strptime(day_str, "%Y%m%d").date()
+                file_start = datetime.combine(file_day, datetime.min.time()).replace(tzinfo=timezone.utc)
+                file_end = file_start + timedelta(days=1)
+                if since is not None and file_end <= since:
+                    continue
+                if until is not None and file_start > until:
+                    continue
+            except ValueError:
+                pass  # non-standard filename — don't skip, fall through to per-line filtering
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if sensor_id is not None and entry.get("sensor_id") != sensor_id:
+                        continue
+                    ts_str = entry.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    if since is not None and dt < since:
+                        continue
+                    if until is not None and dt > until:
+                        continue
+                    entry["_dt"] = dt
+                    entries.append(entry)
+        except Exception:
+            continue
+    return entries
+
+
+def _compute_accuracy_metrics(
+    sensor_id: Optional[str],
+    window_seconds: int,
+    since: Optional[datetime],
+    until: Optional[datetime],
+) -> dict:
+    """Compute RMSE, MAE, accuracy-within-1, binary precision/recall/F1 and fever metrics.
+
+    Aligns each stored ground truth point to the nearest API readings within
+    ``window_seconds``, averages multiple estimates in the window, then accumulates
+    error statistics. Only ground truth entries matching ``sensor_id`` (when set)
+    and inside the optional date range are included.
+    """
+    with _ground_truth_lock:
+        all_gt = list(_ground_truth.values())
+    gt_entries = [
+        e for e in all_gt
+        if (sensor_id is None or e.get("sensor_id") == sensor_id)
+    ]
+    if since or until:
+        filtered = []
+        for e in gt_entries:
+            try:
+                dt = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if since and dt < since:
+                continue
+            if until and dt > until:
+                continue
+            filtered.append(e)
+        gt_entries = filtered
+
+    if not gt_entries:
+        return {"error": "no_ground_truth", "n_ground_truth": 0}
+
+    history = _load_occupancy_history_for_accuracy(sensor_id, since, until)
+
+    # Index history by sensor_id with sorted _dt lists for O(n log m) window lookups.
+    history_by_sensor: Dict[str, List[dict]] = defaultdict(list)
+    for h in history:
+        history_by_sensor[h.get("sensor_id", "")].append(h)
+    for entries_for_sensor in history_by_sensor.values():
+        entries_for_sensor.sort(key=lambda x: x["_dt"])
+    # Pre-extract sorted timestamps per sensor for bisect operations.
+    sensor_timestamps: Dict[str, List[datetime]] = {
+        sid: [h["_dt"] for h in entries_for_sensor]
+        for sid, entries_for_sensor in history_by_sensor.items()
+    }
+
+    # --- Occupancy regression metrics ---
+    sq_errors: List[float] = []
+    abs_errors: List[float] = []
+    within_1: List[bool] = []
+    # Binary occupancy (occupied vs empty)
+    occ_tp = occ_fp = occ_tn = occ_fn = 0
+    # Fever binary metrics
+    fv_tp = fv_fp = fv_tn = fv_fn = 0
+    fv_gt_count = 0
+    unmatched = 0
+
+    for e in gt_entries:
+        try:
+            gt_dt = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00"))
+            # Treat naive timestamps as UTC so comparison with tz-aware history works.
+            if gt_dt.tzinfo is None:
+                gt_dt = gt_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            unmatched += 1
+            continue
+        gt_sid = e.get("sensor_id", "")
+        sensor_hist = history_by_sensor.get(gt_sid, [])
+        if sensor_hist:
+            window_delta = timedelta(seconds=window_seconds)
+            ts_list = sensor_timestamps[gt_sid]
+            lo = bisect.bisect_left(ts_list, gt_dt - window_delta)
+            hi = bisect.bisect_right(ts_list, gt_dt + window_delta)
+            candidates = sensor_hist[lo:hi]
+        else:
+            candidates = []
+        if not candidates:
+            unmatched += 1
+            continue
+
+        valid_occupancies: List[int] = []
+        for h in candidates:
+            try:
+                valid_occupancies.append(int(h.get("occupancy", 0)))
+            except (TypeError, ValueError):
+                continue
+        if not valid_occupancies:
+            unmatched += 1
+            continue
+
+        actual = int(e["actual_occupancy"])
+        est_avg = sum(valid_occupancies) / len(valid_occupancies)
+        est = int(round(est_avg))
+
+        err = est - actual
+        sq_errors.append(err ** 2)
+        abs_errors.append(abs(err))
+        within_1.append(abs(err) <= 1)
+
+        # Binary occupied/empty
+        actual_occ = actual > 0
+        pred_occ = est > 0
+        if actual_occ and pred_occ:
+            occ_tp += 1
+        elif actual_occ and not pred_occ:
+            occ_fn += 1
+        elif not actual_occ and pred_occ:
+            occ_fp += 1
+        else:
+            occ_tn += 1
+
+        # Fever
+        if e.get("actual_fever") is not None:
+            fv_gt_count += 1
+            actual_fv = bool(e["actual_fever"])
+            pred_fv = any(bool(h.get("any_fever", False)) for h in candidates)
+            if actual_fv and pred_fv:
+                fv_tp += 1
+            elif actual_fv and not pred_fv:
+                fv_fn += 1
+            elif not actual_fv and pred_fv:
+                fv_fp += 1
+            else:
+                fv_tn += 1
+
+    n = len(sq_errors)
+    if n == 0:
+        return {
+            "error": "no_matches",
+            "n_ground_truth": len(gt_entries),
+            "n_unmatched": unmatched,
+            "window_seconds": window_seconds,
+        }
+
+    rmse = (sum(sq_errors) / n) ** 0.5
+    mae = sum(abs_errors) / n
+    acc1 = sum(within_1) / n
+
+    def _safe_div(num: int, den: int) -> Optional[float]:
+        return round(num / den, 4) if den > 0 else None
+
+    occ_precision = _safe_div(occ_tp, occ_tp + occ_fp)
+    occ_recall    = _safe_div(occ_tp, occ_tp + occ_fn)
+    occ_f1 = (
+        round(2 * occ_precision * occ_recall / (occ_precision + occ_recall), 4)
+        if occ_precision is not None and occ_recall is not None and (occ_precision + occ_recall) > 0
+        else None
+    )
+
+    result: dict = {
+        "sensor_id": sensor_id,
+        "n_ground_truth": len(gt_entries),
+        "n_matched": n,
+        "n_unmatched": unmatched,
+        "window_seconds": window_seconds,
+        "occupancy": {
+            "rmse": round(rmse, 4),
+            "mae": round(mae, 4),
+            "accuracy_within_1": round(acc1, 4),
+            "binary_occupied": {
+                "tp": occ_tp, "fp": occ_fp, "tn": occ_tn, "fn": occ_fn,
+                "precision": occ_precision,
+                "recall": occ_recall,
+                "f1": occ_f1,
+            },
+        },
+    }
+
+    if fv_gt_count > 0:
+        fv_precision  = _safe_div(fv_tp, fv_tp + fv_fp)
+        fv_recall     = _safe_div(fv_tp, fv_tp + fv_fn)
+        fv_f1 = (
+            round(2 * fv_precision * fv_recall / (fv_precision + fv_recall), 4)
+            if fv_precision is not None and fv_recall is not None and (fv_precision + fv_recall) > 0
+            else None
+        )
+        fv_sens = _safe_div(fv_tp, fv_tp + fv_fn)
+        fv_spec = _safe_div(fv_tn, fv_tn + fv_fp)
+        fv_bal = round((fv_sens + fv_spec) / 2, 4) if fv_sens is not None and fv_spec is not None else None
+        result["fever"] = {
+            "n_labeled": fv_gt_count,
+            "tp": fv_tp, "fp": fv_fp, "tn": fv_tn, "fn": fv_fn,
+            "precision": fv_precision,
+            "recall": fv_recall,
+            "f1": fv_f1,
+            "balanced_accuracy": fv_bal,
+        }
+
+    return result
+
+
+def _normalize_gt_timestamp(ts: str) -> str:
+    """Parse an ISO 8601 timestamp string and return a UTC-normalised isoformat string.
+
+    Raises ``ValueError`` for unparseable inputs so callers can return HTTP 400.
+    """
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def _require_gt_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """Reject requests when GROUND_TRUTH_API_KEY is set and the header doesn't match."""
+    if GROUND_TRUTH_API_KEY and x_api_key != GROUND_TRUTH_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-API-Key")
+
+
+@app.post("/api/occupancy/groundtruth", dependencies=[Depends(_require_gt_api_key)])
+def post_ground_truth(entry: _GroundTruthEntry) -> dict:
+    """Submit a ground truth observation (actual headcount at a given timestamp).
+
+    Re-submitting the same (timestamp, sensor_id) pair overwrites the earlier entry.
+    Used to populate accuracy metrics via GET /api/occupancy/accuracy.
+    """
+    try:
+        ts_norm = _normalize_gt_timestamp(entry.timestamp)
+    except Exception:
+        raise HTTPException(status_code=400, detail="timestamp must be a valid ISO 8601 string")
+    if not 0 <= entry.actual_occupancy <= 50:
+        raise HTTPException(status_code=400, detail="actual_occupancy must be 0–50")
+    sid = entry.sensor_id.strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="sensor_id must not be empty or whitespace")
+    key = f"{ts_norm}|{sid}"
+    record = {
+        "timestamp": ts_norm,
+        "sensor_id": sid,
+        "actual_occupancy": entry.actual_occupancy,
+        "actual_fever": entry.actual_fever,
+        "ts_added": datetime.now(timezone.utc).isoformat(),
+    }
+    with _ground_truth_lock:
+        _ground_truth[key] = record
+    _persist_ground_truth()
+    return {"status": "ok", "key": key, "entry": record}
+
+
+@app.delete("/api/occupancy/groundtruth", dependencies=[Depends(_require_gt_api_key)])
+def delete_ground_truth(
+    timestamp: str = Query(..., description="ISO 8601 timestamp of the entry to remove"),
+    sensor_id: str = Query(..., description="sensor_id of the entry to remove"),
+) -> dict:
+    """Remove a single ground truth entry by (timestamp, sensor_id)."""
+    sid = sensor_id.strip()
+    try:
+        ts_norm = _normalize_gt_timestamp(timestamp)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="timestamp must be a valid ISO 8601 string")
+    key = f"{ts_norm}|{sid}"
+    with _ground_truth_lock:
+        if key not in _ground_truth:
+            raise HTTPException(status_code=404, detail=f"No ground truth entry found for key: {key}")
+        del _ground_truth[key]
+    _persist_ground_truth()
+    return {"status": "deleted", "key": key}
+
+
+@app.get("/api/occupancy/groundtruth")
+def get_ground_truth(
+    sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
+) -> dict:
+    """List stored ground truth entries."""
+    with _ground_truth_lock:
+        all_entries = list(_ground_truth.values())
+    entries = [
+        e for e in all_entries
+        if sensor_id is None or e.get("sensor_id") == sensor_id
+    ]
+    entries.sort(key=lambda e: e.get("timestamp", ""))
+    return {"count": len(entries), "sensor_id": sensor_id, "data": entries}
+
+
+ACCURACY_DEFAULT_LOOKBACK_DAYS = int(os.environ.get("ACCURACY_DEFAULT_LOOKBACK_DAYS", "30"))
+
+
+@app.get("/api/occupancy/accuracy")
+def get_occupancy_accuracy(
+    sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id (default: all)"),
+    window_seconds: int = Query(default=120, ge=10, le=900, description="Match window in seconds (default: 120)"),
+    since: Optional[str] = Query(default=None, description="ISO 8601 start of evaluation range (inclusive); defaults to 30 days ago"),
+    until: Optional[str] = Query(default=None, description="ISO 8601 end of evaluation range (inclusive)"),
+) -> dict:
+    """Compute occupancy accuracy metrics (RMSE, MAE, precision, recall, F1) against stored ground truth.
+
+    Each ground truth point is matched to API readings that fall within
+    ``window_seconds`` of the ground-truth timestamp, and the matched readings
+    are averaged to produce the predicted occupancy value. The proposal
+    evaluation metrics — RMSE between predicted and actual occupancy, and
+    precision/recall for binary occupancy detection — are all returned here.
+    Fever metrics are included when ground truth entries carry ``actual_fever``.
+
+    When ``since`` is omitted the scan is limited to the last
+    ``ACCURACY_DEFAULT_LOOKBACK_DAYS`` days (default 30) to bound I/O.
+    Pass an explicit ``since`` value to extend the window.
+    """
+    since_dt = until_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=400, detail="since must be a valid ISO 8601 string")
+    if until:
+        try:
+            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            raise HTTPException(status_code=400, detail="until must be a valid ISO 8601 string")
+
+    if since_dt is None:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=ACCURACY_DEFAULT_LOOKBACK_DAYS)
+
+    result = _compute_accuracy_metrics(sensor_id, window_seconds, since_dt, until_dt)
+
+    # Per-sensor breakdown when no sensor filter is set
+    if sensor_id is None:
+        with _ground_truth_lock:
+            sensors_with_gt = {e.get("sensor_id") for e in _ground_truth.values() if e.get("sensor_id")}
+        if len(sensors_with_gt) > 1:
+            per_sensor = {}
+            for sid in sorted(sensors_with_gt):
+                per_sensor[sid] = _compute_accuracy_metrics(sid, window_seconds, since_dt, until_dt)
+            result["per_sensor"] = per_sensor
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1664,6 +2530,8 @@ def get_ml_status() -> dict:
         "fever_label_count": sum(1 for v in labels_snap if v.get("fever")),
         "occupancy_distribution": occ_dist,
         "training": training_snap,
+        "eval": training_snap.get("eval"),
+        "split": training_snap.get("split"),
     }
 
 
@@ -1803,7 +2671,7 @@ def _run_training_thread() -> None:
 
     try:
         from sklearn.ensemble import GradientBoostingClassifier  # noqa: PLC0415
-        from sklearn.model_selection import cross_val_score  # noqa: PLC0415
+        from sklearn.metrics import accuracy_score, f1_score  # noqa: PLC0415
     except ImportError:
         with _ml_training_lock:
             _ml_training_status = {
@@ -1826,27 +2694,38 @@ def _run_training_thread() -> None:
     with _ml_training_lock:
         labels_snap = list(_ml_labels.values())
     log(f"Building features for {len(labels_snap)} labelled frames…")
-    features, occ_targets, fever_targets = [], [], []
-    _tmp_paths: List[Path] = []  # temp files downloaded from Blob; cleaned up below
+
+    # Each row is (frame_timestamp_str, feature_vec, occ_label, fever_label).
+    # Sorting by frame timestamp gives a time-ordered dataset for the
+    # 70/15/15 train/val/test split required by the project proposal.
+    rows: List[Tuple[str, Any, int, int]] = []
+    _tmp_paths: List[Path] = []
 
     for lbl in labels_snap:
         try:
-            # .name strips any path components from hand-edited label files;
-            # post_ml_label() already stores basenames, so this is defence-in-depth.
             safe_file = Path(lbl["file"]).name
             path = _ensure_local_copy(safe_file)
             if path is None:
                 log(f"  Skipping missing file: {lbl['file']}")
                 continue
             if path.parent != DATA_DIR:
-                _tmp_paths.append(path)  # track Blob-download temp files for cleanup
+                _tmp_paths.append(path)
             payload = _read_json_payload(path)
+            raw_ts = payload.get("timestamp", "")
+            try:
+                frame_ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                # Fall back to the filename's embedded date (YYYYMMDD_HHMMSS) so the
+                # split remains time-ordered even when the payload timestamp is absent.
+                stem = Path(lbl["file"]).stem
+                try:
+                    frame_ts = datetime.strptime(stem[:15], "%Y%m%d_%H%M%S")
+                except ValueError:
+                    frame_ts = datetime.min
             compact = payload.get("data") or payload
             arr = thermal_data_to_array(compact)
             bg = thermal_background_by_sensor.get(payload.get("sensor_id"))
-            features.append(_ml_extract(arr, bg))
-            occ_targets.append(int(lbl["occupancy"]))
-            fever_targets.append(1 if lbl.get("fever") else 0)
+            rows.append((frame_ts, _ml_extract(arr, bg), int(lbl["occupancy"]), 1 if lbl.get("fever") else 0))
         except Exception as exc:
             log(f"  Warning: {lbl['file']}: {exc}")
 
@@ -1856,7 +2735,10 @@ def _run_training_thread() -> None:
         except Exception:
             pass
 
-    n = len(features)
+    # Sort by frame timestamp (oldest first) for time-based split.
+    rows.sort(key=lambda r: r[0])
+    n = len(rows)
+
     if n < 10:
         with _ml_training_lock:
             _ml_training_status = {
@@ -1867,37 +2749,65 @@ def _run_training_thread() -> None:
             }
         return
 
+    features   = [r[1] for r in rows]
+    occ_targets   = [r[2] for r in rows]
+    fever_targets = [r[3] for r in rows]
+
     X = np.array(features, dtype=np.float32)
-    y_occ = np.array(occ_targets)
+    y_occ   = np.array(occ_targets)
     y_fever = np.array(fever_targets)
     out_dir = Path(os.environ.get("ML_MODEL_DIR", "ml_models"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log(f"Training occupancy model on {n} samples (classes: {sorted(set(occ_targets))})…")
+    # 70 / 15 / 15 time-based split (proposal specification).
+    train_end = max(1, int(n * 0.70))
+    val_end   = max(train_end + 1, int(n * 0.85))
+    n_train, n_val, n_test = train_end, val_end - train_end, n - val_end
+    log(f"Split: {n_train} train / {n_val} val / {n_test} test (time-ordered, 70/15/15)")
+
+    X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
+    y_occ_train, y_occ_val, y_occ_test     = y_occ[:train_end], y_occ[train_end:val_end], y_occ[val_end:]
+    y_fv_train,  y_fv_val,  y_fv_test      = y_fever[:train_end], y_fever[train_end:val_end], y_fever[val_end:]
+
+    eval_results: dict = {}
+
+    log(f"Training occupancy model on {n_train} samples (classes: {sorted(set(occ_targets[:train_end]))})…")
     occ_clf = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
-    try:
-        cv = min(5, max(2, n // 5))
-        scores = cross_val_score(occ_clf, X, y_occ, cv=cv, scoring="accuracy")
-        log(f"  CV accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
-    except Exception as exc:
-        log(f"  CV skipped: {exc}")
-    occ_clf.fit(X, y_occ)
+    occ_clf.fit(X_train, y_occ_train)
+    occ_train_acc = accuracy_score(y_occ_train, occ_clf.predict(X_train))
+    log(f"  Train accuracy: {occ_train_acc:.3f}")
+    occ_eval: dict = {"train_accuracy": round(occ_train_acc, 4)}
+    if n_val > 0:
+        occ_val_acc = accuracy_score(y_occ_val, occ_clf.predict(X_val))
+        log(f"  Val   accuracy: {occ_val_acc:.3f}")
+        occ_eval["val_accuracy"] = round(occ_val_acc, 4)
+    if n_test > 0:
+        occ_test_acc = accuracy_score(y_occ_test, occ_clf.predict(X_test))
+        log(f"  Test  accuracy: {occ_test_acc:.3f}")
+        occ_eval["test_accuracy"] = round(occ_test_acc, 4)
+    eval_results["occupancy"] = occ_eval
     _export_onnx_model(occ_clf, X.shape[1], out_dir / "occupancy_model.onnx", "occupancy_model", log)
 
-    fever_pos = int(y_fever.sum())
+    fever_pos = int(y_fv_train.sum())
     if fever_pos >= 5:
-        log(f"Training fever model ({fever_pos}/{n} positive samples)…")
+        log(f"Training fever model ({fever_pos}/{n_train} positive training samples)…")
         fever_clf = GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
-        try:
-            cv = min(5, max(2, n // 5))
-            scores = cross_val_score(fever_clf, X, y_fever, cv=cv, scoring="f1")
-            log(f"  CV F1: {scores.mean():.3f} ± {scores.std():.3f}")
-        except Exception as exc:
-            log(f"  CV skipped: {exc}")
-        fever_clf.fit(X, y_fever)
+        fever_clf.fit(X_train, y_fv_train)
+        fv_train_f1 = f1_score(y_fv_train, fever_clf.predict(X_train), zero_division=0)
+        log(f"  Train F1: {fv_train_f1:.3f}")
+        fv_eval: dict = {"train_f1": round(fv_train_f1, 4)}
+        if n_val > 0:
+            fv_val_f1 = f1_score(y_fv_val, fever_clf.predict(X_val), zero_division=0)
+            log(f"  Val   F1: {fv_val_f1:.3f}")
+            fv_eval["val_f1"] = round(fv_val_f1, 4)
+        if n_test > 0:
+            fv_test_f1 = f1_score(y_fv_test, fever_clf.predict(X_test), zero_division=0)
+            log(f"  Test  F1: {fv_test_f1:.3f}")
+            fv_eval["test_f1"] = round(fv_test_f1, 4)
+        eval_results["fever"] = fv_eval
         _export_onnx_model(fever_clf, X.shape[1], out_dir / "fever_model.onnx", "fever_model", log)
     else:
-        log(f"Skipping fever model — need ≥5 positive samples, have {fever_pos}")
+        log(f"Skipping fever model — need ≥5 positive training samples, have {fever_pos}")
 
     log("Reloading ML engine with new models…")
     if _ml_engine:
@@ -1906,9 +2816,11 @@ def _run_training_thread() -> None:
     with _ml_training_lock:
         _ml_training_status = {
             "state": "done",
-            "message": f"Trained on {n} samples.",
+            "message": f"Trained on {n_train} samples (val={n_val}, test={n_test}).",
             "ts": datetime.now().isoformat(),
             "log": log_lines,
+            "eval": eval_results,
+            "split": {"train": n_train, "val": n_val, "test": n_test},
         }
 
 
@@ -2004,6 +2916,13 @@ def visualization_page() -> str:
   </div>
 </div>
 <div id="status">Connecting…</div>
+<div id="accuracy-panel" style="margin-top:18px;display:none">
+  <div style="font-size:0.75rem;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">
+    Accuracy vs Ground Truth
+  </div>
+  <div id="accuracy-content" style="display:flex;gap:10px;flex-wrap:wrap;font-size:0.8rem"></div>
+  <div id="accuracy-footer" style="font-size:0.7rem;color:#475569;margin-top:4px"></div>
+</div>
 
 <script>
 const canvas = document.getElementById('thermal');
@@ -2026,6 +2945,44 @@ async function loadSensors() {
       sensorSel.appendChild(opt);
     });
   } catch(e) {}
+}
+
+async function loadAccuracy() {
+  const panel = document.getElementById('accuracy-panel');
+  const content = document.getElementById('accuracy-content');
+  const footer = document.getElementById('accuracy-footer');
+  try {
+    const sid = sensorSel.value || null;
+    const url = '/api/occupancy/accuracy' + (sid ? '?sensor_id=' + encodeURIComponent(sid) : '');
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.error || j.n_ground_truth === 0) { panel.style.display = 'none'; return; }
+    panel.style.display = '';
+    const occ = j.occupancy || {};
+    const bin = occ.binary_occupied || {};
+    const fv  = j.fever || null;
+    const fmt = v => v != null ? (typeof v === 'number' ? v.toFixed(3) : v) : '—';
+    const pct = v => v != null ? (v * 100).toFixed(1) + '%' : '—';
+    let html = '';
+    const tile = (label, val, color) =>
+      `<div style="background:#1e2330;border:1px solid #2d3748;border-radius:6px;padding:8px 14px;min-width:90px">
+        <div style="font-size:0.65rem;color:#64748b;text-transform:uppercase;letter-spacing:.04em">${label}</div>
+        <div style="font-size:1.1rem;font-weight:700;color:${color}">${val}</div>
+      </div>`;
+    html += tile('RMSE', fmt(occ.rmse), '#f8fafc');
+    html += tile('MAE', fmt(occ.mae), '#f8fafc');
+    html += tile('±1 Acc', pct(occ.accuracy_within_1), '#34d399');
+    html += tile('Precision', pct(bin.precision), '#93c5fd');
+    html += tile('Recall', pct(bin.recall), '#93c5fd');
+    html += tile('F1', pct(bin.f1), '#a78bfa');
+    if (fv) {
+      html += tile('Fever F1', pct(fv.f1), '#f87171');
+      html += tile('Fever Recall', pct(fv.recall), '#f87171');
+    }
+    content.innerHTML = html;
+    footer.textContent = `${j.n_matched} of ${j.n_ground_truth} GT points matched (±${j.window_seconds}s window)`;
+  } catch(e) { panel.style.display = 'none'; }
 }
 
 function badge(cls, text) {
@@ -2076,11 +3033,15 @@ function renderFrame(data) {
   // Stats badges
   const occ  = data.occupancy ?? '—';
   const temp = data.room_temperature != null ? data.room_temperature.toFixed(1) + ' °C' : '—';
+  const feverThreshStr = data.effective_fever_threshold != null
+    ? ` ≥${data.effective_fever_threshold.toFixed(1)}°C` : '';
   const feverBadge = data.any_fever
-    ? badge('badge-fever', 'Fever detected')
-    : data.any_elevated
-      ? badge('badge-elevated', 'Elevated temp')
-      : badge('badge-ok', 'No fever');
+    ? badge('badge-fever', `Fever detected${feverThreshStr}`)
+    : data.sustained_elevated
+      ? badge('badge-elevated', 'Sustained elevated temp')
+      : data.any_elevated
+        ? badge('badge-elevated', 'Elevated temp')
+        : badge('badge-ok', 'No fever');
 
   // ML inference badges
   let mlBadge = '';
@@ -2131,11 +3092,12 @@ function restart() {
   poll();
 }
 
-sensorSel.addEventListener('change', restart);
+sensorSel.addEventListener('change', () => { restart(); loadAccuracy(); });
 scaleSel.addEventListener('change', () => { /* re-render on next poll */ });
 showClusters.addEventListener('change', restart);
 
 loadSensors();
+loadAccuracy();
 poll();
 </script>
 </body>
