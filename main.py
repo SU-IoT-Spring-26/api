@@ -378,30 +378,49 @@ _alert_state_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
-    """Load persisted ML frame labels from disk into _ml_labels.
+    """Load persisted ML frame labels from disk (or Blob fallback) into _ml_labels.
 
-    Called unconditionally at startup — DATA_DIR may not exist in Blob-only
-    mode, in which case local load is simply skipped.
+    On a fresh container the local file won't exist, so we fall back to
+    downloading ml/labels.jsonl from Azure Blob Storage when configured.
     """
     global _ml_labels
-    if not DATA_DIR.exists():
-        return
     path = DATA_DIR / "ml_labels.jsonl"
-    if not path.exists():
+    raw: Optional[str] = None
+
+    if path.exists():
+        try:
+            raw = path.read_text()
+        except Exception as e:
+            print(f"Could not read ML labels from disk: {e}")
+
+    if raw is None:
+        container = _get_blob_container()
+        if container is not None:
+            try:
+                blob_client = container.get_blob_client("ml/labels.jsonl")
+                raw = blob_client.download_blob().readall().decode("utf-8")
+                print("Restored ML labels from Azure Blob Storage")
+                if SAVE_LOCAL_DATA:
+                    DATA_DIR.mkdir(parents=True, exist_ok=True)
+                    path.write_text(raw)
+            except Exception as e:
+                print(f"Could not restore ML labels from Blob: {e}")
+
+    if raw is None:
         return
+
     loaded: Dict[str, dict] = {}
     try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entry = json.loads(line)
-                    if "file" in entry:
-                        loaded[entry["file"]] = entry
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                entry = json.loads(line)
+                if "file" in entry:
+                    loaded[entry["file"]] = entry
         _ml_labels = loaded
         print(f"Loaded {len(_ml_labels)} ML label(s)")
     except Exception as e:
-        print(f"Could not load ML labels: {e}")
+        print(f"Could not parse ML labels: {e}")
 
 
 def _persist_ml_labels() -> None:
