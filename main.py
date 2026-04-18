@@ -320,9 +320,11 @@ _ml_training_lock = threading.Lock()
 
 # Per-sensor room metadata (room_name, capacity, building).
 _sensor_metadata: Dict[str, dict] = {}  # sensor_id → {room_name, capacity, building, ts_updated}
+_sensor_metadata_lock = threading.Lock()
 
 # Previous alert state per sensor — used to detect fever/overcapacity rising edges.
 _last_alert_state_by_sensor: Dict[str, dict] = {}  # sensor_id → {fever: bool, overcapacity: bool}
+_alert_state_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
@@ -403,15 +405,33 @@ def _load_sensor_metadata() -> None:
         try:
             loaded = json.loads(raw.decode("utf-8"))
             if isinstance(loaded, dict):
-                _sensor_metadata = loaded
-                print(f"Loaded metadata for {len(_sensor_metadata)} sensor(s)")
+                normalized: Dict[str, dict] = {}
+                for sid, entry in loaded.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    clean: dict = {}
+                    for field in ("room_name", "building", "ts_updated"):
+                        if field in entry:
+                            clean[field] = entry[field]
+                    if "capacity" in entry:
+                        try:
+                            clean["capacity"] = int(entry["capacity"])
+                        except (TypeError, ValueError):
+                            pass  # drop unparseable capacity
+                    normalized[sid] = clean
+                with _sensor_metadata_lock:
+                    _sensor_metadata.clear()
+                    _sensor_metadata.update(normalized)
+                print(f"Loaded metadata for {len(normalized)} sensor(s)")
         except Exception as e:
             print(f"Could not parse sensor_metadata.json: {e}")
 
 
 def _persist_sensor_metadata() -> None:
     """Write sensor metadata to disk and Blob."""
-    content = json.dumps(_sensor_metadata, indent=2).encode("utf-8")
+    with _sensor_metadata_lock:
+        snapshot = dict(_sensor_metadata)
+    content = json.dumps(snapshot, indent=2).encode("utf-8")
     if SAVE_LOCAL_DATA:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         try:
@@ -448,18 +468,24 @@ def _maybe_fire_alerts(sensor_id: str, occupancy_result: dict, now_iso: str) -> 
     """Detect rising edges on fever and overcapacity; fire webhook once per transition."""
     if not ALERT_WEBHOOK_URL:
         return
-    prev = _last_alert_state_by_sensor.get(sensor_id, {"fever": False, "overcapacity": False})
 
     curr_fever = bool(occupancy_result.get("any_fever", False))
-    meta = _sensor_metadata.get(sensor_id, {})
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
     capacity = meta.get("capacity")
     occ = int(occupancy_result.get("occupancy", 0))
     curr_overcapacity = (
         capacity is not None and capacity > 0 and occ / capacity >= ALERT_OVERCAPACITY_PCT
     )
 
+    with _alert_state_lock:
+        prev = _last_alert_state_by_sensor.get(sensor_id, {"fever": False, "overcapacity": False})
+        new_fever = curr_fever and not prev["fever"]
+        new_overcapacity = curr_overcapacity and not prev["overcapacity"]
+        _last_alert_state_by_sensor[sensor_id] = {"fever": curr_fever, "overcapacity": curr_overcapacity}
+
     alerts = []
-    if curr_fever and not prev["fever"]:
+    if new_fever:
         alerts.append({
             "alert_type": "fever",
             "sensor_id": sensor_id,
@@ -471,7 +497,7 @@ def _maybe_fire_alerts(sensor_id: str, occupancy_result: dict, now_iso: str) -> 
             "effective_fever_threshold": occupancy_result.get("effective_fever_threshold"),
             "message": "Fever detected — room may require disinfection.",
         })
-    if curr_overcapacity and not prev["overcapacity"]:
+    if new_overcapacity:
         alerts.append({
             "alert_type": "overcapacity",
             "sensor_id": sensor_id,
@@ -483,8 +509,6 @@ def _maybe_fire_alerts(sensor_id: str, occupancy_result: dict, now_iso: str) -> 
             "occupancy_pct": round(occ / capacity, 3),
             "message": f"Room at or above capacity ({occ}/{capacity}).",
         })
-
-    _last_alert_state_by_sensor[sensor_id] = {"fever": curr_fever, "overcapacity": curr_overcapacity}
 
     for alert in alerts:
         threading.Thread(target=_fire_webhook, args=(alert,), daemon=True).start()
@@ -1134,15 +1158,16 @@ def update_sensor_metadata(sensor_id: str, update: _SensorMetadataUpdate) -> dic
     """
     if update.capacity is not None and update.capacity < 0:
         raise HTTPException(status_code=400, detail="capacity must be >= 0")
-    meta = dict(_sensor_metadata.get(sensor_id, {}))
-    if update.room_name is not None:
-        meta["room_name"] = update.room_name
-    if update.capacity is not None:
-        meta["capacity"] = update.capacity
-    if update.building is not None:
-        meta["building"] = update.building
-    meta["ts_updated"] = datetime.now(timezone.utc).isoformat()
-    _sensor_metadata[sensor_id] = meta
+    with _sensor_metadata_lock:
+        meta = dict(_sensor_metadata.get(sensor_id, {}))
+        if update.room_name is not None:
+            meta["room_name"] = update.room_name
+        if update.capacity is not None:
+            meta["capacity"] = update.capacity
+        if update.building is not None:
+            meta["building"] = update.building
+        meta["ts_updated"] = datetime.now(timezone.utc).isoformat()
+        _sensor_metadata[sensor_id] = meta
     _persist_sensor_metadata()
     return {"sensor_id": sensor_id, "metadata": meta}
 
@@ -1532,7 +1557,7 @@ def get_occupancy_stats(
                 values.append(entry["occupancy"])
     if not values:
         raise HTTPException(status_code=404, detail="No occupancy data available")
-    avg = round(sum(values) / len(values), 2)
+    avg_raw = sum(values) / len(values)
     current = values[-1]
     meta = _sensor_metadata.get(sensor_id or "", {}) if sensor_id else {}
     capacity = meta.get("capacity")
@@ -1545,13 +1570,13 @@ def get_occupancy_stats(
         "total_readings": len(values),
         "min_occupancy": min(values),
         "max_occupancy": max(values),
-        "avg_occupancy": avg,
+        "avg_occupancy": round(avg_raw, 2),
         "current_occupancy": current,
         "occupancy_distribution": dict(Counter(values)),
     }
     if capacity:
         result["current_occupancy_pct"] = round(current / capacity, 3)
-        result["avg_occupancy_pct"] = round(avg / capacity, 3)
+        result["avg_occupancy_pct"] = round(avg_raw / capacity, 3)
         result["max_occupancy_pct"] = round(max(values) / capacity, 3)
     return result
 
@@ -1911,7 +1936,17 @@ def _run_training_thread() -> None:
             if path.parent != DATA_DIR:
                 _tmp_paths.append(path)
             payload = _read_json_payload(path)
-            frame_ts = payload.get("timestamp", "")
+            raw_ts = payload.get("timestamp", "")
+            try:
+                frame_ts = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                # Fall back to the filename's embedded date (YYYYMMDD_HHMMSS) so the
+                # split remains time-ordered even when the payload timestamp is absent.
+                stem = Path(lbl["file"]).stem
+                try:
+                    frame_ts = datetime.strptime(stem[:15], "%Y%m%d_%H%M%S")
+                except ValueError:
+                    frame_ts = datetime.min
             compact = payload.get("data") or payload
             arr = thermal_data_to_array(compact)
             bg = thermal_background_by_sensor.get(payload.get("sensor_id"))

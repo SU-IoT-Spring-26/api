@@ -214,6 +214,71 @@ class TestSensors:
 
 
 # ---------------------------------------------------------------------------
+# PATCH /api/sensors/{sensor_id}
+# ---------------------------------------------------------------------------
+
+class TestSensorMetadataPatch:
+    def test_patch_sets_fields(self, client):
+        r = client.patch("/api/sensors/cam-1", json={"room_name": "Room A", "capacity": 10, "building": "Bldg 1"})
+        assert r.status_code == 200
+        meta = r.json()["metadata"]
+        assert meta["room_name"] == "Room A"
+        assert meta["capacity"] == 10
+        assert meta["building"] == "Bldg 1"
+        assert "ts_updated" in meta
+
+    def test_patch_partial_update_preserves_existing_fields(self, client):
+        client.patch("/api/sensors/cam-1", json={"room_name": "Room A", "capacity": 10})
+        r = client.patch("/api/sensors/cam-1", json={"building": "Bldg 1"})
+        meta = r.json()["metadata"]
+        assert meta["room_name"] == "Room A"
+        assert meta["capacity"] == 10
+        assert meta["building"] == "Bldg 1"
+
+    def test_patch_negative_capacity_rejected(self, client):
+        r = client.patch("/api/sensors/cam-1", json={"capacity": -1})
+        assert r.status_code == 400
+
+    def test_patch_zero_capacity_allowed(self, client):
+        r = client.patch("/api/sensors/cam-1", json={"capacity": 0})
+        assert r.status_code == 200
+        assert r.json()["metadata"]["capacity"] == 0
+
+    def test_get_sensors_returns_updated_metadata(self, client):
+        client.post("/api/thermal", json=_make_compact(sensor_id="cam-1"))
+        client.patch("/api/sensors/cam-1", json={"room_name": "Updated"})
+        body = client.get("/api/sensors").json()
+        assert body["metadata"]["cam-1"]["room_name"] == "Updated"
+
+
+# ---------------------------------------------------------------------------
+# occupancy_pct fields (capacity-derived)
+# ---------------------------------------------------------------------------
+
+class TestOccupancyPctFields:
+    def test_occupancy_pct_absent_without_capacity(self, client):
+        client.post("/api/thermal", json=_make_compact(sensor_id="cam-1"))
+        body = client.get("/api/thermal/current/all").json()
+        assert "cam-1" in body
+        assert "occupancy_pct" not in body["cam-1"]
+
+    def test_occupancy_pct_present_with_capacity(self, client):
+        client.patch("/api/sensors/cam-1", json={"capacity": 20})
+        client.post("/api/thermal", json=_make_compact_with_person(sensor_id="cam-1"))
+        body = client.get("/api/thermal/current/all").json()
+        assert "cam-1" in body
+        assert "occupancy_pct" in body["cam-1"]
+        assert 0.0 <= body["cam-1"]["occupancy_pct"] <= 1.0
+
+    def test_occupancy_pct_zero_capacity_excluded(self, client):
+        client.patch("/api/sensors/cam-1", json={"capacity": 0})
+        client.post("/api/thermal", json=_make_compact(sensor_id="cam-1"))
+        body = client.get("/api/thermal/current/all").json()
+        assert "cam-1" in body
+        assert "occupancy_pct" not in body["cam-1"]
+
+
+# ---------------------------------------------------------------------------
 # GET /api/thermal/history
 # ---------------------------------------------------------------------------
 
