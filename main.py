@@ -2652,7 +2652,7 @@ def post_ml_train() -> dict:
             "ts": datetime.now().isoformat(),
             "log": [],
         }
-    t = threading.Thread(target=_run_training_thread, daemon=True)
+    t = threading.Thread(target=_run_training_thread_wrapper, daemon=True)
     t.start()
     return {"status": "started"}
 
@@ -2824,6 +2824,25 @@ def _run_training_thread() -> None:
             "eval": eval_results,
             "split": {"train": n_train, "val": n_val, "test": n_test},
         }
+
+
+def _run_training_thread_wrapper() -> None:
+    """Top-level wrapper so any uncaught exception in the training thread sets
+    state to 'error' instead of silently leaving it stuck on 'running'."""
+    global _ml_training_status
+    try:
+        _run_training_thread()
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[ML Train] Uncaught exception: {exc}\n{tb}")
+        with _ml_training_lock:
+            _ml_training_status = {
+                "state": "error",
+                "message": f"Unexpected error: {exc}",
+                "ts": datetime.now().isoformat(),
+                "log": _ml_training_status.get("log", []) + [tb],
+            }
 
 
 def _export_onnx_model(clf, n_features: int, out_path: Path, name: str, log) -> None:
