@@ -627,3 +627,119 @@ class TestRestoreStateFromDisk:
         # The newer file (11:00) should win
         loaded = main.latest_thermal_by_sensor["cam-1"]
         assert loaded["pixels"][0]["temp"] == pytest.approx(25.0)
+
+
+# ---------------------------------------------------------------------------
+# POST/DELETE/GET /api/occupancy/groundtruth
+# ---------------------------------------------------------------------------
+
+_GT_ENTRY = {
+    "timestamp": "2026-04-17T10:00:00+00:00",
+    "sensor_id": "cam-1",
+    "actual_occupancy": 3,
+    "actual_fever": False,
+}
+
+
+class TestGroundTruthEndpoints:
+    def test_post_creates_entry(self, client):
+        r = client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["entry"]["actual_occupancy"] == 3
+
+    def test_post_dedup_overwrites(self, client):
+        client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        updated = {**_GT_ENTRY, "actual_occupancy": 5}
+        client.post("/api/occupancy/groundtruth", json=updated)
+        gt = client.get("/api/occupancy/groundtruth").json()
+        assert len(gt["data"]) == 1
+        assert gt["data"][0]["actual_occupancy"] == 5
+
+    def test_post_invalid_timestamp_rejected(self, client):
+        bad = {**_GT_ENTRY, "timestamp": "not-a-date"}
+        assert client.post("/api/occupancy/groundtruth", json=bad).status_code == 400
+
+    def test_post_negative_occupancy_rejected(self, client):
+        bad = {**_GT_ENTRY, "actual_occupancy": -1}
+        assert client.post("/api/occupancy/groundtruth", json=bad).status_code == 400
+
+    def test_delete_removes_entry(self, client):
+        client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        r = client.delete(
+            "/api/occupancy/groundtruth",
+            params={"timestamp": _GT_ENTRY["timestamp"], "sensor_id": _GT_ENTRY["sensor_id"]},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "deleted"
+        assert client.get("/api/occupancy/groundtruth").json()["data"] == []
+
+    def test_delete_missing_entry_returns_404(self, client):
+        r = client.delete(
+            "/api/occupancy/groundtruth",
+            params={"timestamp": "2026-01-01T00:00:00+00:00", "sensor_id": "nope"},
+        )
+        assert r.status_code == 404
+
+    def test_get_returns_all_entries(self, client):
+        client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        second = {**_GT_ENTRY, "timestamp": "2026-04-17T11:00:00+00:00"}
+        client.post("/api/occupancy/groundtruth", json=second)
+        gt = client.get("/api/occupancy/groundtruth").json()
+        assert gt["count"] == 2
+
+    def test_api_key_rejected_when_set(self, client, monkeypatch):
+        monkeypatch.setattr(main, "GROUND_TRUTH_API_KEY", "secret")
+        r = client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        assert r.status_code == 403
+
+    def test_api_key_accepted_when_correct(self, client, monkeypatch):
+        monkeypatch.setattr(main, "GROUND_TRUTH_API_KEY", "secret")
+        r = client.post(
+            "/api/occupancy/groundtruth",
+            json=_GT_ENTRY,
+            headers={"X-API-Key": "secret"},
+        )
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/occupancy/accuracy
+# ---------------------------------------------------------------------------
+
+class TestAccuracyEndpoint:
+    def _post_occupancy_log(self, tmp_path, sensor_id="cam-1", ts="2026-04-17T10:00:05+00:00", occ=3):
+        import json as _json
+        path = tmp_path / "occupancy_20260417.jsonl"
+        entry = {"timestamp": ts, "sensor_id": sensor_id, "occupancy": occ}
+        with path.open("a") as f:
+            f.write(_json.dumps(entry) + "\n")
+
+    def test_no_ground_truth_returns_error_key(self, client):
+        body = client.get("/api/occupancy/accuracy").json()
+        assert body.get("error") == "no_ground_truth"
+
+    def test_accuracy_with_matched_reading(self, client, tmp_path):
+        main.DATA_DIR = tmp_path
+        self._post_occupancy_log(tmp_path)
+        client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        body = client.get("/api/occupancy/accuracy").json()
+        assert "occupancy" in body
+        assert body["n_matched"] >= 1
+        assert body["occupancy"]["rmse"] == pytest.approx(0.0)
+
+    def test_since_filter_excludes_old_entries(self, client, tmp_path):
+        main.DATA_DIR = tmp_path
+        client.post("/api/occupancy/groundtruth", json=_GT_ENTRY)
+        body = client.get(
+            "/api/occupancy/accuracy",
+            params={"since": "2026-04-18T00:00:00+00:00"},
+        ).json()
+        assert body.get("error") == "no_ground_truth" or body.get("n_ground_truth", 0) == 0
+
+    def test_invalid_since_returns_400(self, client):
+        assert client.get("/api/occupancy/accuracy?since=notadate").status_code == 400
+
+    def test_invalid_until_returns_400(self, client):
+        assert client.get("/api/occupancy/accuracy?until=notadate").status_code == 400

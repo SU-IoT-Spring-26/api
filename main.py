@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -273,6 +273,10 @@ ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "").strip()
 # Fraction of capacity that triggers an overcapacity alert (default 1.0 = at or above capacity).
 ALERT_OVERCAPACITY_PCT = float(os.environ.get("ALERT_OVERCAPACITY_PCT", "1.0"))
 
+# Optional API key protecting ground truth mutation endpoints (POST/DELETE).
+# When set, callers must supply the matching X-API-Key header.
+GROUND_TRUTH_API_KEY: Optional[str] = os.environ.get("GROUND_TRUTH_API_KEY") or None
+
 # Occupancy detection parameters
 MIN_HUMAN_TEMP = 30.0
 MAX_HUMAN_TEMP = 45.0
@@ -316,7 +320,7 @@ last_empty_frame_thermal_by_sensor: Dict[str, np.ndarray] = {}
 # meaning a source that has been on all day reaches ~98% absorption after 24 hours.
 STATIONARY_BG_ALPHA = float(os.environ.get("STATIONARY_BG_ALPHA", "0.9995"))
 # Persist to disk every N frames to avoid I/O on every upload (~15 min at default).
-STATIONARY_BG_SAVE_INTERVAL = int(os.environ.get("STATIONARY_BG_SAVE_INTERVAL", "60"))
+STATIONARY_BG_SAVE_INTERVAL = max(1, int(os.environ.get("STATIONARY_BG_SAVE_INTERVAL", "60")))
 stationary_thermal_background_by_sensor: Dict[str, np.ndarray] = {}
 _stationary_bg_frame_count: Dict[str, int] = {}
 
@@ -345,6 +349,7 @@ _ml_labels: Dict[str, dict] = {}  # filename → {file, occupancy, fever, ts}
 # Ground truth labels for accuracy evaluation.
 # Keyed by (timestamp_iso, sensor_id) as a string "ts|sid" for dedup.
 _ground_truth: Dict[str, dict] = {}  # key → {timestamp, sensor_id, actual_occupancy, actual_fever, ts_added}
+_ground_truth_lock = threading.Lock()
 _ml_training_status: dict = {"state": "idle", "message": "", "ts": None, "log": []}
 _ml_training_lock = threading.Lock()
 
@@ -1595,7 +1600,7 @@ def receive_thermal_data(data: dict) -> dict:
             ml_bg = (
                 np.maximum(empty_bg, stat_bg)
                 if empty_bg is not None and stat_bg is not None and empty_bg.shape == stat_bg.shape
-                else (empty_bg or stat_bg)
+                else (empty_bg if empty_bg is not None else stat_bg)
             )
             ml_result = _ml_engine.predict(temp_array_2d, background=ml_bg)
             if ml_result:
@@ -2007,31 +2012,45 @@ def _load_occupancy_history_for_accuracy(
     for path in sorted(DATA_DIR.glob("occupancy_*.jsonl")):
         if not path.is_file():
             continue
+        # Early-prune by date embedded in filename (occupancy_YYYYMMDD.jsonl)
+        if since is not None or until is not None:
+            try:
+                day_str = path.stem[len("occupancy_"):]
+                file_day = datetime.strptime(day_str, "%Y%m%d").date()
+                file_start = datetime.combine(file_day, datetime.min.time()).replace(tzinfo=timezone.utc)
+                file_end = file_start + timedelta(days=1)
+                if since is not None and file_end <= since:
+                    continue
+                if until is not None and file_start > until:
+                    continue
+            except ValueError:
+                pass  # non-standard filename — don't skip, fall through to per-line filtering
         try:
-            for line in path.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if sensor_id is not None and entry.get("sensor_id") != sensor_id:
-                    continue
-                ts_str = entry.get("timestamp")
-                if not ts_str:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-                if since is not None and dt < since:
-                    continue
-                if until is not None and dt > until:
-                    continue
-                entry["_dt"] = dt
-                entries.append(entry)
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if sensor_id is not None and entry.get("sensor_id") != sensor_id:
+                        continue
+                    ts_str = entry.get("timestamp")
+                    if not ts_str:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    if since is not None and dt < since:
+                        continue
+                    if until is not None and dt > until:
+                        continue
+                    entry["_dt"] = dt
+                    entries.append(entry)
         except Exception:
             continue
     return entries
@@ -2160,7 +2179,7 @@ def _compute_accuracy_metrics(
     occ_recall    = _safe_div(occ_tp, occ_tp + occ_fn)
     occ_f1 = (
         round(2 * occ_precision * occ_recall / (occ_precision + occ_recall), 4)
-        if occ_precision and occ_recall and (occ_precision + occ_recall) > 0
+        if occ_precision is not None and occ_recall is not None and (occ_precision + occ_recall) > 0
         else None
     )
 
@@ -2188,7 +2207,7 @@ def _compute_accuracy_metrics(
         fv_recall     = _safe_div(fv_tp, fv_tp + fv_fn)
         fv_f1 = (
             round(2 * fv_precision * fv_recall / (fv_precision + fv_recall), 4)
-            if fv_precision and fv_recall and (fv_precision + fv_recall) > 0
+            if fv_precision is not None and fv_recall is not None and (fv_precision + fv_recall) > 0
             else None
         )
         fv_sens = _safe_div(fv_tp, fv_tp + fv_fn)
@@ -2206,7 +2225,13 @@ def _compute_accuracy_metrics(
     return result
 
 
-@app.post("/api/occupancy/groundtruth")
+def _require_gt_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    """Reject requests when GROUND_TRUTH_API_KEY is set and the header doesn't match."""
+    if GROUND_TRUTH_API_KEY and x_api_key != GROUND_TRUTH_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-API-Key")
+
+
+@app.post("/api/occupancy/groundtruth", dependencies=[Depends(_require_gt_api_key)])
 def post_ground_truth(entry: _GroundTruthEntry) -> dict:
     """Submit a ground truth observation (actual headcount at a given timestamp).
 
@@ -2227,21 +2252,23 @@ def post_ground_truth(entry: _GroundTruthEntry) -> dict:
         "actual_fever": entry.actual_fever,
         "ts_added": datetime.now(timezone.utc).isoformat(),
     }
-    _ground_truth[key] = record
+    with _ground_truth_lock:
+        _ground_truth[key] = record
     _persist_ground_truth()
     return {"status": "ok", "key": key, "entry": record}
 
 
-@app.delete("/api/occupancy/groundtruth")
+@app.delete("/api/occupancy/groundtruth", dependencies=[Depends(_require_gt_api_key)])
 def delete_ground_truth(
     timestamp: str = Query(..., description="ISO 8601 timestamp of the entry to remove"),
     sensor_id: str = Query(..., description="sensor_id of the entry to remove"),
 ) -> dict:
     """Remove a single ground truth entry by (timestamp, sensor_id)."""
     key = f"{timestamp}|{sensor_id}"
-    if key not in _ground_truth:
-        raise HTTPException(status_code=404, detail=f"No ground truth entry found for key: {key}")
-    del _ground_truth[key]
+    with _ground_truth_lock:
+        if key not in _ground_truth:
+            raise HTTPException(status_code=404, detail=f"No ground truth entry found for key: {key}")
+        del _ground_truth[key]
     _persist_ground_truth()
     return {"status": "deleted", "key": key}
 
@@ -2268,21 +2295,26 @@ def get_occupancy_accuracy(
 ) -> dict:
     """Compute occupancy accuracy metrics (RMSE, MAE, precision, recall, F1) against stored ground truth.
 
-    Each ground truth point is matched to the nearest API readings within
-    ``window_seconds``. The proposal evaluation metrics — RMSE between predicted
-    and actual occupancy, and precision/recall for binary occupancy detection —
-    are all returned here. Fever metrics are included when ground truth entries
-    carry ``actual_fever``.
+    Each ground truth point is matched to API readings that fall within
+    ``window_seconds`` of the ground-truth timestamp, and the matched readings
+    are averaged to produce the predicted occupancy value. The proposal
+    evaluation metrics — RMSE between predicted and actual occupancy, and
+    precision/recall for binary occupancy detection — are all returned here.
+    Fever metrics are included when ground truth entries carry ``actual_fever``.
     """
     since_dt = until_dt = None
     if since:
         try:
             since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="since must be a valid ISO 8601 string")
     if until:
         try:
             until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=timezone.utc)
         except Exception:
             raise HTTPException(status_code=400, detail="until must be a valid ISO 8601 string")
 
