@@ -378,30 +378,57 @@ _alert_state_lock = threading.Lock()
 
 
 def _load_ml_labels() -> None:
-    """Load persisted ML frame labels from disk into _ml_labels.
+    """Load persisted ML frame labels from disk (or Blob fallback) into _ml_labels.
 
-    Called unconditionally at startup — DATA_DIR may not exist in Blob-only
-    mode, in which case local load is simply skipped.
+    On a fresh container the local file won't exist, so we fall back to
+    downloading ml/labels.jsonl from Azure Blob Storage when configured.
+    When SAVE_LOCAL_DATA is true, the downloaded content is cached to DATA_DIR
+    so subsequent reads within the same container lifetime stay local.
     """
     global _ml_labels
-    if not DATA_DIR.exists():
-        return
     path = DATA_DIR / "ml_labels.jsonl"
-    if not path.exists():
+
+    if path.exists():
+        loaded: Dict[str, dict] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        if "file" in entry:
+                            loaded[entry["file"]] = entry
+            _ml_labels = loaded
+            print(f"Loaded {len(_ml_labels)} ML label(s)")
+            return
+        except Exception as e:
+            print(f"Could not read ML labels from disk: {e}")
+            # Fall through to Blob with a clean dict (loaded may be partial)
+
+    container = _get_blob_container()
+    if container is None:
         return
-    loaded: Dict[str, dict] = {}
     try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entry = json.loads(line)
-                    if "file" in entry:
-                        loaded[entry["file"]] = entry
-        _ml_labels = loaded
+        blob_client = container.get_blob_client("ml/labels.jsonl")
+        raw = blob_client.download_blob().readall().decode("utf-8")
+        print("Restored ML labels from Azure Blob Storage")
+        blob_loaded: Dict[str, dict] = {}
+        for line in raw.splitlines():
+            line = line.strip()
+            if line:
+                entry = json.loads(line)
+                if "file" in entry:
+                    blob_loaded[entry["file"]] = entry
+        _ml_labels = blob_loaded
         print(f"Loaded {len(_ml_labels)} ML label(s)")
+        if SAVE_LOCAL_DATA:
+            try:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                path.write_text(raw, encoding="utf-8")
+            except Exception as e:
+                print(f"Could not cache ML labels locally: {e}")
     except Exception as e:
-        print(f"Could not load ML labels: {e}")
+        print(f"Could not restore ML labels from Blob: {e}")
 
 
 def _persist_ml_labels() -> None:
