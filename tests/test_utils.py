@@ -11,10 +11,12 @@ from main import (
     collapse_to_compact,
     convert_numpy_types,
     detect_human_heat,
+    detect_subpage_artifact,
     estimate_occupancy,
     estimate_room_temperature,
     expand_thermal_data,
     find_people_clusters,
+    interpolate_subpages,
     temperature_to_color,
     thermal_data_to_array,
 )
@@ -587,3 +589,106 @@ class TestConvertNumpyTypes:
         result = convert_numpy_types((np.int64(1), np.int64(2)))
         assert result == (1, 2)
         assert isinstance(result, tuple)
+
+
+# ---------------------------------------------------------------------------
+# detect_subpage_artifact / interpolate_subpages
+# ---------------------------------------------------------------------------
+
+def _make_checkerboard_frame(base_temp: float = 25.0, offset: float = 1.5, rows: int = 24, cols: int = 32) -> np.ndarray:
+    """Synthetic MLX90640-style subpage artifact: even rows are shifted up, odd rows down."""
+    frame = np.full((rows, cols), base_temp, dtype=float)
+    for r in range(rows):
+        frame[r] += offset if r % 2 == 0 else -offset
+    return frame
+
+
+def _make_clean_frame(base_temp: float = 25.0, rows: int = 24, cols: int = 32) -> np.ndarray:
+    """Uniform frame with small random noise — no systematic row alternation."""
+    rng = np.random.default_rng(42)
+    return base_temp + rng.normal(0, 0.05, (rows, cols))
+
+
+class TestDetectSubpageArtifact:
+    def test_clean_frame_not_flagged(self):
+        frame = _make_clean_frame()
+        is_corrupted, frac = detect_subpage_artifact(frame)
+        assert not is_corrupted
+        assert frac < main.SUBPAGE_CHECKERBOARD_FRAC
+
+    def test_checkerboard_frame_flagged(self):
+        frame = _make_checkerboard_frame(offset=1.5)
+        is_corrupted, frac = detect_subpage_artifact(frame)
+        assert is_corrupted
+        assert frac >= main.SUBPAGE_CHECKERBOARD_FRAC
+
+    def test_weak_offset_below_threshold_not_flagged(self):
+        # offset well below SUBPAGE_ROW_DIFF_THRESHOLD_C (default 0.8 C) → not flagged
+        frame = _make_checkerboard_frame(offset=0.1)
+        is_corrupted, _ = detect_subpage_artifact(frame)
+        assert not is_corrupted
+
+    def test_returns_fraction_in_range(self):
+        frame = _make_checkerboard_frame()
+        _, frac = detect_subpage_artifact(frame)
+        assert 0.0 <= frac <= 1.0
+
+    def test_too_few_rows_returns_false(self):
+        frame = np.full((3, 32), 25.0)
+        is_corrupted, frac = detect_subpage_artifact(frame)
+        assert not is_corrupted
+        assert frac == 0.0
+
+    def test_disabled_via_env(self, monkeypatch):
+        monkeypatch.setattr(main, "SUBPAGE_ARTIFACT_ENABLED", False)
+        frame = _make_checkerboard_frame(offset=2.0)
+        is_corrupted, frac = detect_subpage_artifact(frame)
+        assert not is_corrupted
+        assert frac == 0.0
+
+
+class TestInterpolateSubpages:
+    def test_output_is_average(self):
+        corrupted = np.full((24, 32), 30.0)
+        previous = np.full((24, 32), 20.0)
+        result = interpolate_subpages(corrupted, previous)
+        np.testing.assert_allclose(result, 25.0)
+
+    def test_output_shape_preserved(self):
+        corrupted = np.ones((24, 32))
+        previous = np.zeros((24, 32))
+        result = interpolate_subpages(corrupted, previous)
+        assert result.shape == (24, 32)
+
+    def test_reduces_checkerboard_amplitude(self):
+        clean = _make_clean_frame()
+        corrupted = _make_checkerboard_frame(offset=1.5)
+        blended = interpolate_subpages(corrupted, clean)
+        # Row-mean alternation amplitude in blended should be less than in corrupted
+        row_means_c = corrupted.mean(axis=1)
+        row_means_b = blended.mean(axis=1)
+        amp_corrupted = np.abs(np.diff(row_means_c)).mean()
+        amp_blended = np.abs(np.diff(row_means_b)).mean()
+        assert amp_blended < amp_corrupted
+
+
+class TestEstimateOccupancySubpageFields:
+    """estimate_occupancy must always return subpage fields."""
+
+    def _minimal_payload(self) -> dict:
+        flat = [25.0] * 768
+        return {"t": flat}
+
+    def test_subpage_fields_present_on_success(self):
+        result = estimate_occupancy(self._minimal_payload(), sensor_id="cam1")
+        assert "subpage_corrupted" in result
+        assert "subpage_checkerboard_frac" in result
+
+    def test_subpage_fields_present_on_error(self):
+        result = estimate_occupancy({}, sensor_id="cam1")
+        assert "subpage_corrupted" in result
+        assert "subpage_checkerboard_frac" in result
+
+    def test_clean_frame_not_corrupted(self):
+        result = estimate_occupancy(self._minimal_payload(), sensor_id="cam2")
+        assert result["subpage_corrupted"] is False

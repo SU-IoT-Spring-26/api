@@ -275,6 +275,17 @@ FEVER_THRESHOLD_C = float(os.environ.get("FEVER_THRESHOLD_C", "37.5"))
 FEVER_ELEVATED_THRESHOLD_C = float(os.environ.get("FEVER_ELEVATED_THRESHOLD_C", "37.0"))
 FEVER_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("FEVER_MIN_CONSECUTIVE_FRAMES", "2")))
 
+# MLX90640 subpage artifact detection
+# The sensor alternates subpages; a moving body can produce a checkerboard double-image.
+# Frames flagged as subpage-corrupted fall back to the previous valid frame (no rejection,
+# so occupancy is never dropped to 0 due to sensor read timing).
+SUBPAGE_ARTIFACT_ENABLED = os.environ.get("SUBPAGE_ARTIFACT_ENABLED", "true").lower() in ("1", "true", "yes")
+# Fraction of pixels where odd-row mean temp differs from even-row mean by more than threshold.
+# A clean frame has near-zero even/odd asymmetry; a subpage frame shows alternating-row offsets.
+SUBPAGE_ROW_DIFF_THRESHOLD_C = float(os.environ.get("SUBPAGE_ROW_DIFF_THRESHOLD_C", "0.8"))
+# Minimum fraction of pixel pairs that must show the alternating sign pattern to flag as corrupted.
+SUBPAGE_CHECKERBOARD_FRAC = float(os.environ.get("SUBPAGE_CHECKERBOARD_FRAC", "0.25"))
+
 # Temporal occupancy smoothing and frame sanity (no ground truth required)
 OCCUPANCY_SMOOTH_WINDOW = max(1, int(os.environ.get("OCCUPANCY_SMOOTH_WINDOW", "5")))
 OCCUPANCY_HYSTERESIS_DELTA = max(0, int(os.environ.get("OCCUPANCY_HYSTERESIS_DELTA", "1")))
@@ -293,6 +304,8 @@ last_frame_median_by_sensor: Dict[str, float] = {}
 last_raw_occupancy_by_sensor: Dict[str, int] = {}
 last_smoothed_occupancy_by_sensor: Dict[str, int] = {}
 fever_consecutive_by_sensor: Dict[str, int] = {}
+# Per-sensor last clean (non-subpage-corrupted) frame for fallback interpolation
+_last_clean_frame_by_sensor: Dict[str, np.ndarray] = {}
 
 # In-memory latest state
 latest_thermal_data: Optional[dict] = None
@@ -467,6 +480,59 @@ def collapse_to_compact(expanded_data: dict) -> dict:
     return out
 
 
+def detect_subpage_artifact(temp_array: np.ndarray) -> Tuple[bool, float]:
+    """Detect the MLX90640 subpage chessboard artifact.
+
+    The MLX90640 captures two interleaved subpages (even rows then odd rows, or
+    vice-versa) separated by ~40 ms. When a person is moving, the two subpages
+    disagree and produce a checkerboard pattern: alternating rows are systematically
+    warmer or cooler than their neighbors.
+
+    Detection approach:
+      1. Compute per-row means. Subtract each row's mean from its two neighbours'
+         means. A clean frame has small alternating-row differences; a subpage frame
+         shows large, sign-alternating differences.
+      2. Measure the fraction of (even-row, odd-row) pairs where |diff| > threshold
+         AND the sign alternates (consistent chessboard direction).
+
+    Returns (is_corrupted, checkerboard_fraction).
+    """
+    if not SUBPAGE_ARTIFACT_ENABLED:
+        return False, 0.0
+    h, w = temp_array.shape
+    if h < 4:
+        return False, 0.0
+
+    row_means = temp_array.mean(axis=1)  # shape (h,)
+    # Differences between consecutive rows
+    diffs = row_means[1:] - row_means[:-1]  # shape (h-1,)
+
+    # Look for sign alternation in pairs: diff[i] and diff[i+1] should have opposite signs
+    n_pairs = 0
+    n_alternating = 0
+    for i in range(0, len(diffs) - 1, 2):
+        d0, d1 = diffs[i], diffs[i + 1]
+        if abs(d0) > SUBPAGE_ROW_DIFF_THRESHOLD_C and abs(d1) > SUBPAGE_ROW_DIFF_THRESHOLD_C:
+            n_pairs += 1
+            if d0 * d1 < 0:  # opposite signs
+                n_alternating += 1
+
+    total_pairs = max(1, h // 2 - 1)
+    checkerboard_frac = n_alternating / total_pairs
+    is_corrupted = checkerboard_frac >= SUBPAGE_CHECKERBOARD_FRAC
+    return is_corrupted, checkerboard_frac
+
+
+def interpolate_subpages(corrupted: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    """Blend a corrupted frame with the previous clean frame to suppress the artifact.
+
+    Rather than discarding the corrupted frame entirely (which would stall occupancy
+    updates), we average the two frames. This smooths out the chessboard offset while
+    retaining any genuine thermal changes that occurred since the previous frame.
+    """
+    return (corrupted.astype(float) + previous.astype(float)) / 2.0
+
+
 def _validate_thermal_payload(data: dict) -> None:
     """Reject malformed frames before processing (avoids crashes on empty or length-mismatch data)."""
     if "t" in data:
@@ -568,6 +634,19 @@ def find_people_clusters(human_mask: np.ndarray, temp_array: np.ndarray) -> List
 def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> dict:
     try:
         temp_array_2d = thermal_data_to_array(thermal_data)
+
+        # Subpage artifact detection: blend with previous clean frame if corrupted
+        subpage_corrupted = False
+        subpage_frac = 0.0
+        if sensor_id is not None:
+            subpage_corrupted, subpage_frac = detect_subpage_artifact(temp_array_2d)
+            if subpage_corrupted and sensor_id in _last_clean_frame_by_sensor:
+                temp_array_2d = interpolate_subpages(
+                    temp_array_2d, _last_clean_frame_by_sensor[sensor_id]
+                )
+            if not subpage_corrupted:
+                _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+
         room_temp = estimate_room_temperature(temp_array_2d)
         array_for_detection = temp_array_2d
         use_delta = False
@@ -594,6 +673,8 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
             "elevated_count": elevated_count,
             "any_fever": fever_count > 0,
             "any_elevated": elevated_count > 0,
+            "subpage_corrupted": subpage_corrupted,
+            "subpage_checkerboard_frac": round(subpage_frac, 3),
         }
     except Exception as e:
         return {
@@ -604,6 +685,8 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
             "elevated_count": 0,
             "any_fever": False,
             "any_elevated": False,
+            "subpage_corrupted": False,
+            "subpage_checkerboard_frac": 0.0,
             "error": str(e),
         }
 
