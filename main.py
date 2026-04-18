@@ -851,7 +851,7 @@ def prepare_thermal_frame_for_analysis(
             if cached_clean_frame.shape == temp_array_2d.shape:
                 temp_array_2d = interpolate_subpages(temp_array_2d, cached_clean_frame)
             else:
-                _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+                _last_clean_frame_by_sensor.pop(sensor_id, None)
         if not subpage_corrupted:
             _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
     return temp_array_2d, subpage_corrupted, subpage_frac
@@ -987,6 +987,8 @@ def estimate_occupancy(
     *,
     _prepared: Optional[Tuple[np.ndarray, bool, float]] = None,
 ) -> dict:
+    subpage_corrupted = False
+    subpage_frac = 0.0
     try:
         if _prepared is not None:
             temp_array_2d, subpage_corrupted, subpage_frac = _prepared
@@ -1058,8 +1060,8 @@ def estimate_occupancy(
             "elevated_count": 0,
             "any_fever": False,
             "any_elevated": False,
-            "subpage_corrupted": False,
-            "subpage_checkerboard_frac": 0.0,
+            "subpage_corrupted": subpage_corrupted,
+            "subpage_checkerboard_frac": round(subpage_frac, 3),
             "error": str(e),
         }
 
@@ -1702,7 +1704,7 @@ def receive_thermal_data(data: dict) -> dict:
         _maybe_update_thermal_background(
             sensor_id, corrected_frame, int(occupancy_result.get("occupancy_effective_raw", 0))
         )
-        _update_stationary_background(sensor_id, temp_array_2d)
+        _update_stationary_background(sensor_id, corrected_frame)
         if _ml_engine is not None and _ml_engine.available:
             empty_bg = thermal_background_by_sensor.get(sensor_id)
             stat_bg = stationary_thermal_background_by_sensor.get(sensor_id)
@@ -1711,7 +1713,7 @@ def receive_thermal_data(data: dict) -> dict:
                 if empty_bg is not None and stat_bg is not None and empty_bg.shape == stat_bg.shape
                 else (empty_bg if empty_bg is not None else stat_bg)
             )
-            ml_result = _ml_engine.predict(temp_array_2d, background=ml_bg)
+            ml_result = _ml_engine.predict(corrected_frame, background=ml_bg)
             if ml_result:
                 occupancy_result["ml"] = ml_result
     except Exception as e:
