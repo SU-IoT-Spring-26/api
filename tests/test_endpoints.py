@@ -63,7 +63,9 @@ class TestPostThermal:
         assert body["occupancy"] >= 1
 
     def test_compact_with_fever_sets_fever_flag(self, client):
-        # Two consecutive fever frames needed to confirm fever
+        # Prime the stationary background with a room-temp frame (same 10×10 shape and
+        # sensor_id) so the background is ~21 °C before fever frames arrive.
+        client.post("/api/thermal", json=_make_compact(w=10, h=10, sensor_id="test-sensor"))
         payload = _make_compact_with_fever()
         client.post("/api/thermal", json=payload)
         body = client.post("/api/thermal", json=payload).json()
@@ -530,7 +532,7 @@ class TestOccupancyPredict:
 
     def test_horizon_out_of_range_returns_422(self, client):
         assert client.get("/api/occupancy/predict?horizon_hours=0").status_code == 422
-        assert client.get("/api/occupancy/predict?horizon_hours=49").status_code == 422
+        assert client.get("/api/occupancy/predict?horizon_hours=169").status_code == 422
 
     def test_bucket_fields_present(self, client):
         body = client.get("/api/occupancy/predict?horizon_hours=1").json()

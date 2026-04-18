@@ -2244,10 +2244,13 @@ def post_ground_truth(entry: _GroundTruthEntry) -> dict:
         raise HTTPException(status_code=400, detail="timestamp must be a valid ISO 8601 string")
     if not 0 <= entry.actual_occupancy <= 50:
         raise HTTPException(status_code=400, detail="actual_occupancy must be 0–50")
-    key = f"{entry.timestamp}|{entry.sensor_id}"
+    sid = entry.sensor_id.strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="sensor_id must not be empty or whitespace")
+    key = f"{entry.timestamp}|{sid}"
     record = {
         "timestamp": entry.timestamp,
-        "sensor_id": entry.sensor_id,
+        "sensor_id": sid,
         "actual_occupancy": entry.actual_occupancy,
         "actual_fever": entry.actual_fever,
         "ts_added": datetime.now(timezone.utc).isoformat(),
@@ -2278,8 +2281,10 @@ def get_ground_truth(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id"),
 ) -> dict:
     """List stored ground truth entries."""
+    with _ground_truth_lock:
+        all_entries = list(_ground_truth.values())
     entries = [
-        e for e in _ground_truth.values()
+        e for e in all_entries
         if sensor_id is None or e.get("sensor_id") == sensor_id
     ]
     entries.sort(key=lambda e: e.get("timestamp", ""))
