@@ -2835,13 +2835,14 @@ def _run_training_thread_wrapper() -> None:
     except Exception as exc:  # noqa: BLE001
         import traceback
         tb = traceback.format_exc()
-        print(f"[ML Train] Uncaught exception: {exc}\n{tb}")
+        sanitized = f"{type(exc).__name__}: {exc}"
+        print(f"[ML Train] Uncaught exception: {sanitized}\n{tb}")
         with _ml_training_lock:
             _ml_training_status = {
                 "state": "error",
-                "message": f"Unexpected error: {exc}",
+                "message": f"Unexpected error: {sanitized}",
                 "ts": datetime.now().isoformat(),
-                "log": _ml_training_status.get("log", []) + [tb],
+                "log": _ml_training_status.get("log", []),
             }
 
 

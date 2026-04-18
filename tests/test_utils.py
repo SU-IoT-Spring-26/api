@@ -5,6 +5,7 @@ import pytest
 import main
 from main import (
     _parse_temperature,
+    _run_training_thread_wrapper,
     _sanitize_sensor_id_for_filename,
     _validate_thermal_payload,
     apply_occupancy_signal_processing,
@@ -692,3 +693,26 @@ class TestEstimateOccupancySubpageFields:
     def test_clean_frame_not_corrupted(self):
         result = estimate_occupancy(self._minimal_payload(), sensor_id="cam2")
         assert result["subpage_corrupted"] is False
+
+
+# ---------------------------------------------------------------------------
+# _run_training_thread_wrapper
+# ---------------------------------------------------------------------------
+
+class TestRunTrainingThreadWrapper:
+    """Wrapper must catch any exception and set status to 'error', not leave it on 'running'."""
+
+    def test_uncaught_exception_sets_error_state(self, monkeypatch):
+        monkeypatch.setattr(main, "_ml_training_status", {"state": "running", "log": []})
+        monkeypatch.setattr(main, "_run_training_thread", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        _run_training_thread_wrapper()
+        assert main._ml_training_status["state"] == "error"
+        assert "RuntimeError" in main._ml_training_status["message"]
+        assert "boom" in main._ml_training_status["message"]
+
+    def test_traceback_not_leaked_to_log(self, monkeypatch):
+        monkeypatch.setattr(main, "_ml_training_status", {"state": "running", "log": []})
+        monkeypatch.setattr(main, "_run_training_thread", lambda: (_ for _ in ()).throw(ValueError("secret path")))
+        _run_training_thread_wrapper()
+        for entry in main._ml_training_status.get("log", []):
+            assert "secret path" not in entry or entry == ""
