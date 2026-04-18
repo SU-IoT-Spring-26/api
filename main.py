@@ -2690,6 +2690,7 @@ def _run_training_thread() -> None:
     log_lines: List[str] = []
 
     def log(msg: str) -> None:
+        global _ml_training_status
         log_lines.append(msg)
         with _ml_training_lock:
             _ml_training_status = {**_ml_training_status, "message": msg, "log": list(log_lines)}
