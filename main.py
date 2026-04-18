@@ -382,8 +382,8 @@ def _load_ml_labels() -> None:
 
     On a fresh container the local file won't exist, so we fall back to
     downloading ml/labels.jsonl from Azure Blob Storage when configured.
-    The downloaded content is always written to DATA_DIR so subsequent
-    reads within the same container lifetime stay local.
+    When SAVE_LOCAL_DATA is true, the downloaded content is cached to DATA_DIR
+    so subsequent reads within the same container lifetime stay local.
     """
     global _ml_labels
     path = DATA_DIR / "ml_labels.jsonl"
@@ -419,11 +419,12 @@ def _load_ml_labels() -> None:
                     loaded[entry["file"]] = entry
         _ml_labels = loaded
         print(f"Loaded {len(_ml_labels)} ML label(s)")
-        try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_text(raw)
-        except Exception as e:
-            print(f"Could not cache ML labels locally: {e}")
+        if SAVE_LOCAL_DATA:
+            try:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                path.write_text(raw)
+            except Exception as e:
+                print(f"Could not cache ML labels locally: {e}")
     except Exception as e:
         print(f"Could not restore ML labels from Blob: {e}")
 
