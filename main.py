@@ -387,11 +387,11 @@ def _load_ml_labels() -> None:
     """
     global _ml_labels
     path = DATA_DIR / "ml_labels.jsonl"
-    loaded: Dict[str, dict] = {}
 
     if path.exists():
+        loaded: Dict[str, dict] = {}
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -403,6 +403,7 @@ def _load_ml_labels() -> None:
             return
         except Exception as e:
             print(f"Could not read ML labels from disk: {e}")
+            # Fall through to Blob with a clean dict (loaded may be partial)
 
     container = _get_blob_container()
     if container is None:
@@ -411,18 +412,19 @@ def _load_ml_labels() -> None:
         blob_client = container.get_blob_client("ml/labels.jsonl")
         raw = blob_client.download_blob().readall().decode("utf-8")
         print("Restored ML labels from Azure Blob Storage")
+        blob_loaded: Dict[str, dict] = {}
         for line in raw.splitlines():
             line = line.strip()
             if line:
                 entry = json.loads(line)
                 if "file" in entry:
-                    loaded[entry["file"]] = entry
-        _ml_labels = loaded
+                    blob_loaded[entry["file"]] = entry
+        _ml_labels = blob_loaded
         print(f"Loaded {len(_ml_labels)} ML label(s)")
         if SAVE_LOCAL_DATA:
             try:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
-                path.write_text(raw)
+                path.write_text(raw, encoding="utf-8")
             except Exception as e:
                 print(f"Could not cache ML labels locally: {e}")
     except Exception as e:

@@ -799,3 +799,19 @@ class TestLoadMlLabelsBlob:
         monkeypatch.setattr(main, "_get_blob_container", lambda: None)
         _load_ml_labels()
         assert main._ml_labels == {}
+
+    def test_partial_local_parse_does_not_pollute_blob_restore(self, monkeypatch, tmp_path):
+        # Local file has one valid line then a malformed line that will raise mid-parse.
+        # Blob has one clean entry. Result must come entirely from Blob, not mixed.
+        valid_line = '{"file":"partial.json","occupancy":1,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        bad_line = "not valid json{"
+        (tmp_path / "ml_labels.jsonl").write_text(valid_line + "\n" + bad_line + "\n", encoding="utf-8")
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(main, "_ml_labels", {})
+        monkeypatch.setattr(main, "SAVE_LOCAL_DATA", False)
+        blob_line = '{"file":"clean_blob.json","occupancy":0,"fever":false,"ts":"2026-01-01T00:00:00"}'
+        container = self._make_blob_container(blob_line + "\n")
+        monkeypatch.setattr(main, "_get_blob_container", lambda: container)
+        _load_ml_labels()
+        assert "clean_blob.json" in main._ml_labels
+        assert "partial.json" not in main._ml_labels
