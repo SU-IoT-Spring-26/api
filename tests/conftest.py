@@ -39,6 +39,7 @@ def reset_global_state():
     main.stationary_thermal_background_by_sensor.clear()
     main._stationary_bg_frame_count.clear()
     main.elevated_consecutive_by_sensor.clear()
+    main._last_clean_frame_by_sensor.clear()
     main._data_counter = 0
     main._ground_truth.clear()
     yield

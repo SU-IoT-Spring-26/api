@@ -301,6 +301,17 @@ FEVER_AMBIENT_COMP_C = float(os.environ.get("FEVER_AMBIENT_COMP_C", "0.1"))
 # range for this many consecutive frames (independent of the full-fever gate).
 ELEVATED_MIN_CONSECUTIVE_FRAMES = max(1, int(os.environ.get("ELEVATED_MIN_CONSECUTIVE_FRAMES", "5")))
 
+# MLX90640 subpage artifact detection
+# The sensor alternates subpages; a moving body can produce a checkerboard double-image.
+# Frames flagged as subpage-corrupted fall back to the previous valid frame (no rejection,
+# so occupancy is never dropped to 0 due to sensor read timing).
+SUBPAGE_ARTIFACT_ENABLED = os.environ.get("SUBPAGE_ARTIFACT_ENABLED", "true").lower() in ("1", "true", "yes")
+# Minimum row-mean delta (°C) for a row-diff pair to be counted toward the checkerboard score.
+# A clean frame has near-zero even/odd asymmetry; a subpage frame shows alternating-row offsets.
+SUBPAGE_ROW_DIFF_THRESHOLD_C = float(os.environ.get("SUBPAGE_ROW_DIFF_THRESHOLD_C", "0.8"))
+# Minimum fraction of row-diff pairs that must show the alternating sign pattern to flag as corrupted.
+SUBPAGE_CHECKERBOARD_FRAC = float(os.environ.get("SUBPAGE_CHECKERBOARD_FRAC", "0.25"))
+
 # Temporal occupancy smoothing and frame sanity (no ground truth required)
 OCCUPANCY_SMOOTH_WINDOW = max(1, int(os.environ.get("OCCUPANCY_SMOOTH_WINDOW", "5")))
 OCCUPANCY_HYSTERESIS_DELTA = max(0, int(os.environ.get("OCCUPANCY_HYSTERESIS_DELTA", "1")))
@@ -331,6 +342,8 @@ last_raw_occupancy_by_sensor: Dict[str, int] = {}
 last_smoothed_occupancy_by_sensor: Dict[str, int] = {}
 fever_consecutive_by_sensor: Dict[str, int] = {}
 elevated_consecutive_by_sensor: Dict[str, int] = {}
+# Per-sensor last clean (non-subpage-corrupted) frame for fallback interpolation
+_last_clean_frame_by_sensor: Dict[str, np.ndarray] = {}
 
 # In-memory latest state
 latest_thermal_data: Optional[dict] = None
@@ -767,6 +780,83 @@ def collapse_to_compact(expanded_data: dict) -> dict:
     return out
 
 
+def detect_subpage_artifact(temp_array: np.ndarray) -> Tuple[bool, float]:
+    """Detect the MLX90640 subpage chessboard artifact.
+
+    The MLX90640 captures two interleaved subpages (even rows then odd rows, or
+    vice-versa) separated by ~40 ms. When a person is moving, the two subpages
+    disagree and produce a checkerboard pattern: alternating rows are systematically
+    warmer or cooler than their neighbors.
+
+    Detection approach:
+      1. Compute per-row means, then compute differences between consecutive row
+         means. A clean frame has small, sign-random differences; a subpage-corrupted
+         frame shows large differences whose signs tend to alternate every row.
+      2. Step through diff pairs (d[0],d[1]), (d[2],d[3]), … and count pairs where
+         both magnitudes exceed the threshold AND the signs are opposite.
+
+    Returns (is_corrupted, checkerboard_fraction).
+    """
+    if not SUBPAGE_ARTIFACT_ENABLED:
+        return False, 0.0
+    h, w = temp_array.shape
+    if h < 4:
+        return False, 0.0
+
+    row_means = temp_array.mean(axis=1)  # shape (h,)
+    # Differences between consecutive rows
+    diffs = row_means[1:] - row_means[:-1]  # shape (h-1,)
+
+    # Look for sign alternation in pairs: diff[i] and diff[i+1] should have opposite signs
+    n_alternating = 0
+    total_pairs = 0
+    for i in range(0, len(diffs) - 1, 2):
+        d0, d1 = diffs[i], diffs[i + 1]
+        total_pairs += 1
+        if abs(d0) > SUBPAGE_ROW_DIFF_THRESHOLD_C and abs(d1) > SUBPAGE_ROW_DIFF_THRESHOLD_C:
+            if d0 * d1 < 0:  # opposite signs
+                n_alternating += 1
+
+    checkerboard_frac = n_alternating / max(1, total_pairs)
+    is_corrupted = checkerboard_frac >= SUBPAGE_CHECKERBOARD_FRAC
+    return is_corrupted, checkerboard_frac
+
+
+def interpolate_subpages(corrupted: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    """Blend a corrupted frame with the previous clean frame to suppress the artifact.
+
+    Rather than discarding the corrupted frame entirely (which would stall occupancy
+    updates), we average the two frames. This smooths out the chessboard offset while
+    retaining any genuine thermal changes that occurred since the previous frame.
+    """
+    return (corrupted.astype(float) + previous.astype(float)) / 2.0
+
+
+def prepare_thermal_frame_for_analysis(
+    thermal_data: dict, sensor_id: Optional[str] = None
+) -> Tuple[np.ndarray, bool, float]:
+    """Convert thermal data to a 2-D array and apply subpage artifact correction.
+
+    Returns (corrected_array, subpage_corrupted, checkerboard_frac). Updates
+    _last_clean_frame_by_sensor so the same corrected frame is used by all
+    downstream steps (occupancy, signal processing, background update).
+    """
+    temp_array_2d = thermal_data_to_array(thermal_data)
+    subpage_corrupted = False
+    subpage_frac = 0.0
+    if sensor_id is not None:
+        subpage_corrupted, subpage_frac = detect_subpage_artifact(temp_array_2d)
+        cached_clean_frame = _last_clean_frame_by_sensor.get(sensor_id)
+        if subpage_corrupted and cached_clean_frame is not None:
+            if cached_clean_frame.shape == temp_array_2d.shape:
+                temp_array_2d = interpolate_subpages(temp_array_2d, cached_clean_frame)
+            else:
+                _last_clean_frame_by_sensor.pop(sensor_id, None)
+        if not subpage_corrupted:
+            _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+    return temp_array_2d, subpage_corrupted, subpage_frac
+
+
 def _validate_thermal_payload(data: dict) -> None:
     """Reject malformed frames before processing (avoids crashes on empty or length-mismatch data)."""
     if "t" in data:
@@ -891,9 +981,22 @@ def find_people_clusters(
     return people_clusters
 
 
-def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> dict:
+def estimate_occupancy(
+    thermal_data: dict,
+    sensor_id: Optional[str] = None,
+    *,
+    _prepared: Optional[Tuple[np.ndarray, bool, float]] = None,
+) -> dict:
+    subpage_corrupted = False
+    subpage_frac = 0.0
     try:
-        temp_array_2d = thermal_data_to_array(thermal_data)
+        if _prepared is not None:
+            temp_array_2d, subpage_corrupted, subpage_frac = _prepared
+        else:
+            temp_array_2d, subpage_corrupted, subpage_frac = prepare_thermal_frame_for_analysis(
+                thermal_data, sensor_id
+            )
+
         room_temp = estimate_room_temperature(temp_array_2d)
         array_for_detection = temp_array_2d
         use_delta = False
@@ -945,6 +1048,8 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
             "any_fever": fever_count > 0,
             "any_elevated": elevated_count > 0,
             "effective_fever_threshold": round(eff_fever, 2),
+            "subpage_corrupted": subpage_corrupted,
+            "subpage_checkerboard_frac": round(subpage_frac, 3),
         }
     except Exception as e:
         return {
@@ -955,6 +1060,8 @@ def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> d
             "elevated_count": 0,
             "any_fever": False,
             "any_elevated": False,
+            "subpage_corrupted": subpage_corrupted,
+            "subpage_checkerboard_frac": round(subpage_frac, 3),
             "error": str(e),
         }
 
@@ -1588,15 +1695,16 @@ def receive_thermal_data(data: dict) -> dict:
             compact_data = collapse_to_compact(latest_thermal_data)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-    occupancy_result = estimate_occupancy(data, sensor_id=sensor_id)
+    prepared = prepare_thermal_frame_for_analysis(data, sensor_id=sensor_id)
+    corrected_frame = prepared[0]
+    occupancy_result = estimate_occupancy(data, sensor_id=sensor_id, _prepared=prepared)
     occupancy_result["sensor_id"] = sensor_id
     try:
-        temp_array_2d = thermal_data_to_array(data)
-        apply_occupancy_signal_processing(sensor_id, occupancy_result, temp_array_2d)
+        apply_occupancy_signal_processing(sensor_id, occupancy_result, corrected_frame)
         _maybe_update_thermal_background(
-            sensor_id, temp_array_2d, int(occupancy_result.get("occupancy_effective_raw", 0))
+            sensor_id, corrected_frame, int(occupancy_result.get("occupancy_effective_raw", 0))
         )
-        _update_stationary_background(sensor_id, temp_array_2d)
+        _update_stationary_background(sensor_id, corrected_frame)
         if _ml_engine is not None and _ml_engine.available:
             empty_bg = thermal_background_by_sensor.get(sensor_id)
             stat_bg = stationary_thermal_background_by_sensor.get(sensor_id)
@@ -1605,7 +1713,7 @@ def receive_thermal_data(data: dict) -> dict:
                 if empty_bg is not None and stat_bg is not None and empty_bg.shape == stat_bg.shape
                 else (empty_bg if empty_bg is not None else stat_bg)
             )
-            ml_result = _ml_engine.predict(temp_array_2d, background=ml_bg)
+            ml_result = _ml_engine.predict(corrected_frame, background=ml_bg)
             if ml_result:
                 occupancy_result["ml"] = ml_result
     except Exception as e:
