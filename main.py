@@ -489,11 +489,11 @@ def detect_subpage_artifact(temp_array: np.ndarray) -> Tuple[bool, float]:
     warmer or cooler than their neighbors.
 
     Detection approach:
-      1. Compute per-row means. Subtract each row's mean from its two neighbours'
-         means. A clean frame has small alternating-row differences; a subpage frame
-         shows large, sign-alternating differences.
-      2. Measure the fraction of (even-row, odd-row) pairs where |diff| > threshold
-         AND the sign alternates (consistent chessboard direction).
+      1. Compute per-row means, then compute differences between consecutive row
+         means. A clean frame has small, sign-random differences; a subpage-corrupted
+         frame shows large differences whose signs tend to alternate every row.
+      2. Step through diff pairs (d[0],d[1]), (d[2],d[3]), … and count pairs where
+         both magnitudes exceed the threshold AND the signs are opposite.
 
     Returns (is_corrupted, checkerboard_fraction).
     """
@@ -530,6 +530,31 @@ def interpolate_subpages(corrupted: np.ndarray, previous: np.ndarray) -> np.ndar
     retaining any genuine thermal changes that occurred since the previous frame.
     """
     return (corrupted.astype(float) + previous.astype(float)) / 2.0
+
+
+def prepare_thermal_frame_for_analysis(
+    thermal_data: dict, sensor_id: Optional[str] = None
+) -> Tuple[np.ndarray, bool, float]:
+    """Convert thermal data to a 2-D array and apply subpage artifact correction.
+
+    Returns (corrected_array, subpage_corrupted, checkerboard_frac). Updates
+    _last_clean_frame_by_sensor so the same corrected frame is used by all
+    downstream steps (occupancy, signal processing, background update).
+    """
+    temp_array_2d = thermal_data_to_array(thermal_data)
+    subpage_corrupted = False
+    subpage_frac = 0.0
+    if sensor_id is not None:
+        subpage_corrupted, subpage_frac = detect_subpage_artifact(temp_array_2d)
+        cached_clean_frame = _last_clean_frame_by_sensor.get(sensor_id)
+        if subpage_corrupted and cached_clean_frame is not None:
+            if cached_clean_frame.shape == temp_array_2d.shape:
+                temp_array_2d = interpolate_subpages(temp_array_2d, cached_clean_frame)
+            else:
+                _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+        if not subpage_corrupted:
+            _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+    return temp_array_2d, subpage_corrupted, subpage_frac
 
 
 def _validate_thermal_payload(data: dict) -> None:
@@ -630,23 +655,19 @@ def find_people_clusters(human_mask: np.ndarray, temp_array: np.ndarray) -> List
     return people_clusters
 
 
-def estimate_occupancy(thermal_data: dict, sensor_id: Optional[str] = None) -> dict:
+def estimate_occupancy(
+    thermal_data: dict,
+    sensor_id: Optional[str] = None,
+    *,
+    _prepared: Optional[Tuple[np.ndarray, bool, float]] = None,
+) -> dict:
     try:
-        temp_array_2d = thermal_data_to_array(thermal_data)
-
-        # Subpage artifact detection: blend with previous clean frame if corrupted
-        subpage_corrupted = False
-        subpage_frac = 0.0
-        if sensor_id is not None:
-            subpage_corrupted, subpage_frac = detect_subpage_artifact(temp_array_2d)
-            cached_clean_frame = _last_clean_frame_by_sensor.get(sensor_id)
-            if subpage_corrupted and cached_clean_frame is not None:
-                if cached_clean_frame.shape == temp_array_2d.shape:
-                    temp_array_2d = interpolate_subpages(temp_array_2d, cached_clean_frame)
-                else:
-                    _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
-            if not subpage_corrupted:
-                _last_clean_frame_by_sensor[sensor_id] = temp_array_2d.copy()
+        if _prepared is not None:
+            temp_array_2d, subpage_corrupted, subpage_frac = _prepared
+        else:
+            temp_array_2d, subpage_corrupted, subpage_frac = prepare_thermal_frame_for_analysis(
+                thermal_data, sensor_id
+            )
 
         room_temp = estimate_room_temperature(temp_array_2d)
         array_for_detection = temp_array_2d
@@ -1276,13 +1297,14 @@ def receive_thermal_data(data: dict) -> dict:
             compact_data = collapse_to_compact(latest_thermal_data)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-    occupancy_result = estimate_occupancy(data, sensor_id=sensor_id)
+    prepared = prepare_thermal_frame_for_analysis(data, sensor_id=sensor_id)
+    corrected_frame = prepared[0]
+    occupancy_result = estimate_occupancy(data, sensor_id=sensor_id, _prepared=prepared)
     occupancy_result["sensor_id"] = sensor_id
     try:
-        temp_array_2d = thermal_data_to_array(data)
-        apply_occupancy_signal_processing(sensor_id, occupancy_result, temp_array_2d)
+        apply_occupancy_signal_processing(sensor_id, occupancy_result, corrected_frame)
         _maybe_update_thermal_background(
-            sensor_id, temp_array_2d, int(occupancy_result.get("occupancy_effective_raw", 0))
+            sensor_id, corrected_frame, int(occupancy_result.get("occupancy_effective_raw", 0))
         )
         if _ml_engine is not None and _ml_engine.available:
             ml_result = _ml_engine.predict(

@@ -36,6 +36,7 @@ def reset_global_state():
     main.last_raw_occupancy_by_sensor.clear()
     main.last_smoothed_occupancy_by_sensor.clear()
     main.fever_consecutive_by_sensor.clear()
+    main._last_clean_frame_by_sensor.clear()
     main._data_counter = 0
     yield
 
