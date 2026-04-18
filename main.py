@@ -350,6 +350,7 @@ _ml_labels: Dict[str, dict] = {}  # filename → {file, occupancy, fever, ts}
 # Keyed by (timestamp_iso, sensor_id) as a string "ts|sid" for dedup.
 _ground_truth: Dict[str, dict] = {}  # key → {timestamp, sensor_id, actual_occupancy, actual_fever, ts_added}
 _ground_truth_lock = threading.Lock()
+_ground_truth_persist_lock = threading.Lock()  # serialises file/blob writes
 _ml_training_status: dict = {"state": "idle", "message": "", "ts": None, "log": []}
 _ml_training_lock = threading.Lock()
 
@@ -597,21 +598,22 @@ def _persist_ground_truth() -> None:
     """Rewrite ground_truth.jsonl from in-memory dict and sync to Blob."""
     with _ground_truth_lock:
         snapshot = list(_ground_truth.values())
-    if SAVE_LOCAL_DATA:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path = DATA_DIR / "ground_truth.jsonl"
-        try:
-            with open(path, "w") as f:
-                for entry in snapshot:
-                    f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-        except Exception as e:
-            print(f"Error saving ground truth locally: {e}")
-    if SAVE_TO_BLOB:
-        try:
-            content = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in snapshot)
-            _upload_blob("occupancy/ground_truth.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
-        except Exception as e:
-            print(f"Error uploading ground truth to Blob: {e}")
+    with _ground_truth_persist_lock:
+        if SAVE_LOCAL_DATA:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            path = DATA_DIR / "ground_truth.jsonl"
+            try:
+                with open(path, "w") as f:
+                    for entry in snapshot:
+                        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            except Exception as e:
+                print(f"Error saving ground truth locally: {e}")
+        if SAVE_TO_BLOB:
+            try:
+                content = "".join(json.dumps(e, separators=(",", ":")) + "\n" for e in snapshot)
+                _upload_blob("occupancy/ground_truth.jsonl", content.encode("utf-8"), content_type="application/jsonlines")
+            except Exception as e:
+                print(f"Error uploading ground truth to Blob: {e}")
 
 
 def _load_thermal_background(sensor_id: str) -> None:
@@ -2267,7 +2269,8 @@ def delete_ground_truth(
     sensor_id: str = Query(..., description="sensor_id of the entry to remove"),
 ) -> dict:
     """Remove a single ground truth entry by (timestamp, sensor_id)."""
-    key = f"{timestamp}|{sensor_id}"
+    sid = sensor_id.strip()
+    key = f"{timestamp}|{sid}"
     with _ground_truth_lock:
         if key not in _ground_truth:
             raise HTTPException(status_code=404, detail=f"No ground truth entry found for key: {key}")
@@ -2291,11 +2294,14 @@ def get_ground_truth(
     return {"count": len(entries), "sensor_id": sensor_id, "data": entries}
 
 
+ACCURACY_DEFAULT_LOOKBACK_DAYS = int(os.environ.get("ACCURACY_DEFAULT_LOOKBACK_DAYS", "30"))
+
+
 @app.get("/api/occupancy/accuracy")
 def get_occupancy_accuracy(
     sensor_id: Optional[str] = Query(default=None, description="Filter by sensor_id (default: all)"),
     window_seconds: int = Query(default=120, ge=10, le=900, description="Match window in seconds (default: 120)"),
-    since: Optional[str] = Query(default=None, description="ISO 8601 start of evaluation range (inclusive)"),
+    since: Optional[str] = Query(default=None, description="ISO 8601 start of evaluation range (inclusive); defaults to 30 days ago"),
     until: Optional[str] = Query(default=None, description="ISO 8601 end of evaluation range (inclusive)"),
 ) -> dict:
     """Compute occupancy accuracy metrics (RMSE, MAE, precision, recall, F1) against stored ground truth.
@@ -2306,6 +2312,10 @@ def get_occupancy_accuracy(
     evaluation metrics — RMSE between predicted and actual occupancy, and
     precision/recall for binary occupancy detection — are all returned here.
     Fever metrics are included when ground truth entries carry ``actual_fever``.
+
+    When ``since`` is omitted the scan is limited to the last
+    ``ACCURACY_DEFAULT_LOOKBACK_DAYS`` days (default 30) to bound I/O.
+    Pass an explicit ``since`` value to extend the window.
     """
     since_dt = until_dt = None
     if since:
@@ -2323,11 +2333,15 @@ def get_occupancy_accuracy(
         except Exception:
             raise HTTPException(status_code=400, detail="until must be a valid ISO 8601 string")
 
+    if since_dt is None:
+        since_dt = datetime.now(timezone.utc) - timedelta(days=ACCURACY_DEFAULT_LOOKBACK_DAYS)
+
     result = _compute_accuracy_metrics(sensor_id, window_seconds, since_dt, until_dt)
 
     # Per-sensor breakdown when no sensor filter is set
-    if sensor_id is None and _ground_truth:
-        sensors_with_gt = {e.get("sensor_id") for e in _ground_truth.values() if e.get("sensor_id")}
+    if sensor_id is None:
+        with _ground_truth_lock:
+            sensors_with_gt = {e.get("sensor_id") for e in _ground_truth.values() if e.get("sensor_id")}
         if len(sensors_with_gt) > 1:
             per_sensor = {}
             for sid in sorted(sensors_with_gt):
