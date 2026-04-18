@@ -745,3 +745,99 @@ class TestAccuracyEndpoint:
 
     def test_invalid_until_returns_400(self, client):
         assert client.get("/api/occupancy/accuracy?until=notadate").status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ml/train  +  _run_training_thread regression
+# ---------------------------------------------------------------------------
+
+class TestMLTrain:
+    """Tests for the /api/ml/train endpoint and the background training thread."""
+
+    # ------------------------------------------------------------------
+    # Helper: build a minimal in-memory label set + matching tmp files
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _seed_labels(tmp_path: Path, n: int = 10) -> dict:
+        """Write *n* compact JSON frames to tmp_path and return a labels dict."""
+        import json as _json
+
+        labels: dict = {}
+        for i in range(n):
+            name = f"thermal_20260101_{i:06d}_compact.json"
+            payload = {
+                "w": 4, "h": 2,
+                "min": 21.0, "max": 22.0,
+                "t": [21.0 + i * 0.1] * 8,
+                "timestamp": f"2026-01-01T00:0{i // 60:02d}:{i % 60:02d}",
+                "sensor_id": "test-sensor",
+            }
+            (tmp_path / name).write_text(_json.dumps(payload))
+            labels[name] = {
+                "file": name,
+                "occupancy": i % 3,
+                "fever": False,
+                "ts": payload["timestamp"],
+            }
+        return labels
+
+    # ------------------------------------------------------------------
+    # Endpoint-level tests (via HTTP client)
+    # ------------------------------------------------------------------
+
+    def test_train_requires_min_labels_returns_400(self, client):
+        """POST /api/ml/train must reject with 400 when fewer than 10 labels exist."""
+        r = client.post("/api/ml/train")
+        assert r.status_code == 400
+        assert "10" in r.json()["detail"]
+
+    def test_train_already_running_returns_200_status(self, client, monkeypatch):
+        """POST /api/ml/train returns already_running when training is in progress."""
+        monkeypatch.setattr(
+            main,
+            "_ml_training_status",
+            {"state": "running", "message": "busy", "ts": None, "log": []},
+        )
+        r = client.post("/api/ml/train")
+        assert r.status_code == 200
+        assert r.json()["status"] == "already_running"
+
+    # ------------------------------------------------------------------
+    # Regression: nested log() must not raise UnboundLocalError
+    # ------------------------------------------------------------------
+
+    def test_training_thread_log_no_unbound_error(self, monkeypatch, tmp_path):
+        """
+        Regression: _run_training_thread()'s nested log() reassigns the global
+        _ml_training_status.  Without `global _ml_training_status` inside log(),
+        Python raises UnboundLocalError on the {**_ml_training_status, ...} read.
+
+        This test calls _run_training_thread() synchronously with a minimal
+        in-memory label set so any exception propagates immediately and asserts
+        that (a) no UnboundLocalError is raised and (b) the first log() line
+        ("Building features for…") is recorded in the training status.
+        """
+        labels = self._seed_labels(tmp_path, n=10)
+
+        monkeypatch.setattr(main, "_ml_labels", labels)
+        monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+        # Reset training status to a clean state before the thread runs.
+        main._ml_training_status = {
+            "state": "idle", "message": "", "ts": None, "log": []
+        }
+        # Suppress ONNX export (skl2onnx not guaranteed in all envs).
+        monkeypatch.setattr(main, "_export_onnx_model", lambda *a, **kw: None)
+
+        # Run synchronously — any exception (including UnboundLocalError) propagates.
+        main._run_training_thread()
+
+        status = main._ml_training_status
+        # Thread must have advanced past the initial log() call.
+        assert status["state"] in {"done", "error"}, (
+            f"Unexpected training state: {status['state']!r} — message: {status.get('message')}"
+        )
+        assert any("Building features" in line for line in status.get("log", [])), (
+            "Expected 'Building features…' log line was not recorded; "
+            f"log was: {status.get('log')}"
+        )
