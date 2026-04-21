@@ -10,3 +10,5 @@ onnxruntime>=1.17.0
 # ML training (used by the /ml Studio page to train models from labelled frames)
 scikit-learn>=1.4.0
 skl2onnx>=0.5.0
+supabase>=2.28.3
+python-dotenv>=0.19.0
